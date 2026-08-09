@@ -52,16 +52,11 @@ jobs:
           yarn --cwd frontend install --frozen-lockfile
           yarn --cwd frontend build
 
-      - name: Finalize permanent CI and commit
+      - name: Commit verified application wiring
         run: |
-          mkdir -p .github/workflows
-          cp scripts/openfawu/openfawu-ci.yml.template .github/workflows/openfawu-ci.yml
           git restore frontend/public/env-config.js 2>/dev/null || true
-          rm -f scripts/openfawu/patch_existing.py
-          rm -f scripts/openfawu/openfawu-ci.yml.template
-          rm -f .github/workflows/apply-legal-solo-foundation.yml
           git config user.name "openFaWu foundation bot"
           git config user.email "actions@users.noreply.github.com"
-          git add -A
-          git commit -m "feat: establish single-user legal workspace foundation"
+          git add README.md .gitignore config/settings/base.py frontend/src/App.tsx frontend/src/components/layout/NavMenu.tsx
+          git commit -m "feat: wire openFaWu solo mode into upstream entry points"
           git push origin HEAD:agent/legal-solo-foundation
