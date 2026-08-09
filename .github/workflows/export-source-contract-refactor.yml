@@ -1,0 +1,29 @@
+name: Export source for contract review refactor
+
+on:
+  push:
+    branches:
+      - "agent/legal-solo-foundation"
+    paths:
+      - ".github/workflows/export-source-contract-refactor.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/legal-solo-foundation
+          fetch-depth: 1
+      - name: Package source
+        run: |
+          tar --exclude=.git --exclude=frontend/node_modules --exclude=frontend/dist -czf /tmp/openfawu-contract-refactor.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openfawu-contract-refactor-source
+          path: /tmp/openfawu-contract-refactor.tar.gz
+          retention-days: 1
+          if-no-files-found: error
