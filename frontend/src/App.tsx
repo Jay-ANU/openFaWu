@@ -90,7 +90,13 @@ import { CorpusGroupManagement } from "./components/corpus_groups";
 import { LeaderboardRoute } from "./components/routes/LeaderboardRoute";
 import { GlobalDiscussionsRoute } from "./components/routes/GlobalDiscussionsRoute";
 import { ThreadSearchRoute } from "./views/ThreadSearchRoute";
-import { DiscoveryLanding } from "./views/DiscoveryLanding";
+import {
+  ContractReviewDashboard,
+  ContractReviewWorkspace,
+  LocalCodexPage,
+  NewContractReviewPage,
+  ReviewRulesPage,
+} from "./features/legal";
 import { DiscoverSearchResults } from "./views/DiscoverSearchResults";
 import { CentralRouteManager } from "./routing/CentralRouteManager";
 import { updateAnnotationDisplayParams } from "./utils/navigationUtils";
@@ -341,8 +347,17 @@ export const App = () => {
           {/* Landing/Discovery Page - Main entry point */}
           <Route
             path="/"
-            element={isLoading ? <div /> : <DiscoveryLanding />}
+            element={isLoading ? <div /> : <ContractReviewDashboard />}
           />
+          <Route path="/legal" element={<Navigate to="/reviews" replace />} />
+          <Route path="/reviews" element={<ContractReviewDashboard />} />
+          <Route path="/reviews/new" element={<NewContractReviewPage />} />
+          <Route
+            path="/reviews/:reviewId"
+            element={<ContractReviewWorkspace />}
+          />
+          <Route path="/review-rules" element={<ReviewRulesPage />} />
+          <Route path="/codex" element={<LocalCodexPage />} />
           {/* Simple declarative routes with explicit prefixes */}
 
           {/* Document routes */}

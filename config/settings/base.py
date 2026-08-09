@@ -34,6 +34,10 @@ if READ_DOT_ENV_FILE:
     # OS environment variables take precedence over variables from .env
     env.read_env(str(ROOT_DIR / ".env"))
 
+# openFaWu single-user product switch. The underlying permission system stays
+# enabled; this flag controls product defaults and community-facing surfaces.
+LEGAL_SOLO_MODE = env.bool("LEGAL_SOLO_MODE", default=False)
+
 # GENERAL
 # ------------------------------------------------------------------------------
 # https://docs.djangoproject.com/en/dev/ref/settings/#allowed-hosts
@@ -181,6 +185,7 @@ LOCAL_APPS = [
     "opencontractserver.discovery",
     "opencontractserver.benchmarks",
     "opencontractserver.research",
+    "opencontractserver.legal_workspace",
 ]
 
 # https://docs.djangoproject.com/en/dev/ref/settings/#installed-apps

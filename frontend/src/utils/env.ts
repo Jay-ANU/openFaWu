@@ -13,6 +13,7 @@ export interface EnvConfig {
   REACT_APP_USE_AUTH0: boolean;
   REACT_APP_USE_ANALYZERS: boolean;
   REACT_APP_ALLOW_IMPORTS: boolean;
+  REACT_APP_CODEX_BRIDGE_URL: string;
   REACT_APP_POSTHOG_API_KEY: string;
   REACT_APP_POSTHOG_HOST: string;
   /**
@@ -72,6 +73,10 @@ export function getRuntimeEnv(): EnvConfig {
     ),
     REACT_APP_ALLOW_IMPORTS: toBoolean(
       winEnv["REACT_APP_ALLOW_IMPORTS"] ?? metaEnv["REACT_APP_ALLOW_IMPORTS"]
+    ),
+    REACT_APP_CODEX_BRIDGE_URL: getString(
+      "REACT_APP_CODEX_BRIDGE_URL",
+      "http://127.0.0.1:8765"
     ),
     REACT_APP_POSTHOG_API_KEY: getString("REACT_APP_POSTHOG_API_KEY"),
     REACT_APP_POSTHOG_HOST: getString(

@@ -1,3 +1,10 @@
+<!-- OPENFAWU-DERIVATIVE -->
+# openFaWu · 单人私有合同审查工作台
+
+本仓库基于 OpenContracts 构建。openFaWu 的主流程是“上传合同 → 逐条审查 → 修改确认 → 完成交付”，RAG 与本地 Codex 只作为后台辅助能力。启动方式和实现范围见 [OPENFAWU.md](OPENFAWU.md)，合同审查说明见 [docs/legal-solo/contract-review.md](docs/legal-solo/contract-review.md)。下方保留完整上游说明与归属信息。
+
+---
+
 <p align="center">
   <img src="docs/assets/images/brand/icon_mark.svg" alt="OpenContracts" height="84">
 </p>

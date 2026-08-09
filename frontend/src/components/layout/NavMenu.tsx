@@ -68,7 +68,7 @@ const navbarCustomStyles = `
     background: rgba(255, 255, 255, 0.15) !important;
     color: rgba(255, 255, 255, 0.9) !important;
   }
-  /* [OpenContracts] wordmark — Source Serif 4 with the brackets preserved.
+  /* [openFaWu] wordmark — Source Serif 4 with the brackets preserved.
      Overrides the @os-legal/ui default of 600-weight Inter so the
      wordmark reads as a typographic mark, not a UI label. Sized a step
      below the old [cite] mark so the longer name keeps the same visual
@@ -241,7 +241,7 @@ export const NavMenu = () => {
         size={28}
         bracketColor={OS_LEGAL_COLORS.warmPaper}
         nodeColor={OS_LEGAL_COLORS.accent}
-        ariaLabel="OpenContracts"
+        ariaLabel="openFaWu"
       />
     ),
     []
@@ -253,7 +253,7 @@ export const NavMenu = () => {
         <UserSettingsModal />
         <MobileNavMenu
           logo={logoNode}
-          brandName="[OpenContracts]"
+          brandName="[openFaWu]"
           items={mobileNavItems}
           activeId={activeId}
           userName={displayName}
@@ -274,7 +274,7 @@ export const NavMenu = () => {
       <NavbarHeightSync />
       <NavBar
         logo={logoNode}
-        brandName="[OpenContracts]"
+        brandName="[openFaWu]"
         version={VERSION_TAG}
         items={navItems}
         activeId={activeId}
