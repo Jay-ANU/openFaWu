@@ -23,8 +23,12 @@ jobs:
 
       - name: Validate Python foundation
         run: |
-          python -m compileall -q opencontractserver/legal_workspace
+          python -m compileall -q opencontractserver/legal_workspace openfawu_codex_bridge
+          python -m unittest discover -s openfawu_codex_bridge/tests -v
           python scripts/openfawu/validate_foundation.py
+          bash -n scripts/openfawu/codex-bridge-init.sh
+          bash -n scripts/openfawu/codex-bridge-up.sh
+          bash -n scripts/openfawu/codex-bridge-token.sh
 
       - name: Validate solo compose
         run: |
