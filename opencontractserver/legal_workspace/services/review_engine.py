@@ -140,15 +140,24 @@ def mark_review_failed(review_run: ReviewRun, message: str) -> None:
     )
 
 
-@transaction.atomic
 def run_contract_review(review_run_id: int) -> ReviewRun:
     review_run = (
-        ReviewRun.objects.select_for_update()
+        ReviewRun.objects
         .select_related("document", "review_profile", "workspace__corpus")
         .get(pk=review_run_id)
     )
 
-    if review_run.status in {ReviewRunStatus.CANCELLED, ReviewRunStatus.COMPLETED}:
+    if review_run.status in {
+        ReviewRunStatus.PARSING,
+        ReviewRunStatus.EXTRACTING,
+        ReviewRunStatus.MATCHING_RULES,
+        ReviewRunStatus.ANALYZING,
+        ReviewRunStatus.VERIFYING,
+        ReviewRunStatus.READY_FOR_REVIEW,
+        ReviewRunStatus.CANCELLED,
+        ReviewRunStatus.COMPLETED,
+    }:
+        # A duplicate task must not overwrite an active or already reviewed run.
         return review_run
 
     text = read_document_text(review_run)
@@ -169,33 +178,33 @@ def run_contract_review(review_run_id: int) -> ReviewRun:
             ]
         )
 
-    if review_run.status == ReviewRunStatus.PENDING:
+    if review_run.status in {
+        ReviewRunStatus.PENDING,
+        ReviewRunStatus.WAITING_FOR_DOCUMENT,
+    }:
         _set_status(review_run, ReviewRunStatus.PARSING)
-    elif review_run.status == ReviewRunStatus.WAITING_FOR_DOCUMENT:
-        _set_status(review_run, ReviewRunStatus.PARSING)
-    elif review_run.status != ReviewRunStatus.PARSING:
-        review_run.status = ReviewRunStatus.PARSING
-        review_run.current_stage = ReviewRunStatus.PARSING
-        review_run.save(update_fields=["status", "current_stage", "updated_at"])
+    else:
+        return review_run
 
     parsed_clauses = parse_contract_clauses(text)
-    review_run.clauses.all().delete()
-    review_run.findings.all().delete()
-    ContractClause.objects.bulk_create(
-        [
-            ContractClause(
-                review_run=review_run,
-                clause_type=clause.clause_type,
-                heading=clause.heading,
-                text=clause.text,
-                source_start=clause.source_start,
-                source_end=clause.source_end,
-                sort_order=clause.sort_order,
-                confidence=clause.confidence,
-            )
-            for clause in parsed_clauses
-        ]
-    )
+    with transaction.atomic():
+        review_run.clauses.all().delete()
+        review_run.findings.all().delete()
+        ContractClause.objects.bulk_create(
+            [
+                ContractClause(
+                    review_run=review_run,
+                    clause_type=clause.clause_type,
+                    heading=clause.heading,
+                    text=clause.text,
+                    source_start=clause.source_start,
+                    source_end=clause.source_end,
+                    sort_order=clause.sort_order,
+                    confidence=clause.confidence,
+                )
+                for clause in parsed_clauses
+            ]
+        )
     clause_models = list(review_run.clauses.order_by("sort_order", "id"))
 
     _set_status(review_run, ReviewRunStatus.EXTRACTING)
@@ -254,7 +263,8 @@ def run_contract_review(review_run_id: int) -> ReviewRun:
                 sort_order=sort_order,
             )
         )
-    ContractFinding.objects.bulk_create(findings)
+    with transaction.atomic():
+        ContractFinding.objects.bulk_create(findings)
 
     _set_status(review_run, ReviewRunStatus.VERIFYING)
     severity_counts: dict[str, int] = {}

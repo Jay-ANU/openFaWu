@@ -571,19 +571,36 @@ def m_restart_contract_review(
     run = _review_queryset(user).filter(pk=id).first()
     if run is None:
         raise GraphQLError("审查任务不存在。")
+    if run.status in {
+        ReviewRunStatus.PENDING,
+        ReviewRunStatus.PARSING,
+        ReviewRunStatus.EXTRACTING,
+        ReviewRunStatus.MATCHING_RULES,
+        ReviewRunStatus.ANALYZING,
+        ReviewRunStatus.VERIFYING,
+    }:
+        raise GraphQLError("审查任务正在排队或执行，请勿重复提交。")
+
     run.status = ReviewRunStatus.PENDING
     run.current_stage = ReviewRunStatus.PENDING
     run.error_message = ""
+    run.summary = ""
+    run.started_at = None
     run.completed_at = None
     run.save(
         update_fields=[
             "status",
             "current_stage",
             "error_message",
+            "summary",
+            "started_at",
             "completed_at",
             "updated_at",
         ]
     )
+    if run.workspace.matter_status == "completed":
+        run.workspace.matter_status = "active"
+        run.workspace.save(update_fields=["matter_status", "updated_at"])
     transaction.on_commit(lambda: run_contract_review_task.delay(run.id))
     return ContractReviewActionPayload(
         ok=True,
