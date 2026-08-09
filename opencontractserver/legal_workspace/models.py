@@ -161,10 +161,29 @@ class PlaybookRule(TimeStampedModel):
     )
     required_terms = models.JSONField(default=list, blank=True)
     prohibited_terms = models.JSONField(default=list, blank=True)
+    required_terms_mode = models.CharField(
+        max_length=16,
+        choices=(("all", "全部出现"), ("any", "至少出现一项")),
+        default="all",
+    )
+    applicability = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="规则适用条件，例如合同类型、我方角色或审查背景标记。",
+    )
     standard_position = models.TextField(blank=True, default="")
     fallback_position = models.TextField(blank=True, default="")
     suggested_language = models.TextField(blank=True, default="")
     legal_basis_description = models.TextField(blank=True, default="")
+    business_question = models.TextField(
+        blank=True,
+        default="",
+        help_text="命中规则后需要业务补充确认的问题。",
+    )
+    blocking = models.BooleanField(
+        default=False,
+        help_text="命中后是否应阻断审查完成。",
+    )
     sort_order = models.IntegerField(default=0)
     enabled = models.BooleanField(default=True, db_index=True)
 
@@ -324,6 +343,52 @@ class ReviewRun(TimeStampedModel):
         return f"ReviewRun#{self.pk or 'new'} · {self.document.title or self.document_id}"
 
 
+class ContractClause(TimeStampedModel):
+    """A navigable contract section extracted from the source document."""
+
+    review_run = models.ForeignKey(
+        ReviewRun,
+        on_delete=models.CASCADE,
+        related_name="clauses",
+    )
+    clause_type = models.CharField(max_length=64, default="other", db_index=True)
+    heading = models.CharField(max_length=512)
+    text = models.TextField()
+    source_start = models.PositiveIntegerField(default=0)
+    source_end = models.PositiveIntegerField(default=0)
+    page_number = models.PositiveIntegerField(null=True, blank=True)
+    sort_order = models.IntegerField(default=0)
+    confidence = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("sort_order", "id")
+        indexes = [
+            models.Index(fields=["review_run", "sort_order"]),
+            models.Index(fields=["review_run", "clause_type"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(source_end__gte=models.F("source_start")),
+                name="legal_clause_end_after_start",
+            ),
+            models.CheckConstraint(
+                condition=Q(confidence__isnull=True)
+                | (Q(confidence__gte=0.0) & Q(confidence__lte=1.0)),
+                name="legal_clause_confidence_between_zero_and_one",
+            ),
+        ]
+
+    def clean(self) -> None:
+        super().clean()
+        if self.source_end < self.source_start:
+            raise ValidationError({"source_end": "条款结束位置不能早于开始位置。"})
+        if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
+            raise ValidationError({"confidence": "置信度必须位于 0 到 1 之间。"})
+
+    def __str__(self) -> str:
+        return f"{self.heading} · {self.clause_type}"
+
+
 class ContractFinding(TimeStampedModel):
     """A risk finding bound to exact source evidence and an optional playbook rule."""
 
@@ -334,6 +399,15 @@ class ContractFinding(TimeStampedModel):
     )
     category = models.CharField(max_length=64, db_index=True)
     title = models.CharField(max_length=255)
+    risk_type = models.CharField(max_length=64, default="playbook", db_index=True)
+    clause = models.ForeignKey(
+        ContractClause,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="findings",
+    )
+    clause_title = models.CharField(max_length=512, blank=True, default="")
     severity = models.CharField(
         max_length=16,
         choices=RiskSeverity.choices,
@@ -347,6 +421,8 @@ class ContractFinding(TimeStampedModel):
     )
     risk_summary = models.TextField()
     source_quote = models.TextField()
+    source_start = models.PositiveIntegerField(null=True, blank=True)
+    source_end = models.PositiveIntegerField(null=True, blank=True)
     source_annotation = models.ForeignKey(
         "annotations.Annotation",
         on_delete=models.SET_NULL,
@@ -367,8 +443,12 @@ class ContractFinding(TimeStampedModel):
         blank=True,
         related_name="legal_findings_as_basis",
     )
+    business_impact = models.TextField(blank=True, default="")
     recommended_action = models.TextField(blank=True, default="")
     suggested_replacement = models.TextField(blank=True, default="")
+    fallback_position = models.TextField(blank=True, default="")
+    required_confirmation = models.TextField(blank=True, default="")
+    rule_snapshot = models.JSONField(default=dict, blank=True)
     confidence = models.FloatField(null=True, blank=True)
     verification_status = models.CharField(
         max_length=32,
@@ -404,6 +484,12 @@ class ContractFinding(TimeStampedModel):
         super().clean()
         if self.confidence is not None and not 0.0 <= self.confidence <= 1.0:
             raise ValidationError({"confidence": "置信度必须位于 0 到 1 之间。"})
+        if (
+            self.source_start is not None
+            and self.source_end is not None
+            and self.source_end < self.source_start
+        ):
+            raise ValidationError({"source_end": "证据结束位置不能早于开始位置。"})
         if self.verification_status == VerificationStatus.VERIFIED:
             if not self.source_annotation_id or not self.source_quote.strip():
                 raise ValidationError(

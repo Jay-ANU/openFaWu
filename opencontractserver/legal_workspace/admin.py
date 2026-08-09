@@ -1,6 +1,7 @@
 from django.contrib import admin
 
 from opencontractserver.legal_workspace.models import (
+    ContractClause,
     ContractFinding,
     LegalWorkspace,
     PlaybookRule,
@@ -87,6 +88,20 @@ class ReviewRunAdmin(admin.ModelAdmin):
     readonly_fields = ("created_at", "updated_at", "started_at", "completed_at")
 
 
+@admin.register(ContractClause)
+class ContractClauseAdmin(admin.ModelAdmin):
+    list_display = (
+        "heading",
+        "review_run",
+        "clause_type",
+        "sort_order",
+        "confidence",
+    )
+    list_filter = ("clause_type",)
+    search_fields = ("heading", "text", "review_run__document__title")
+    raw_id_fields = ("review_run",)
+
+
 @admin.register(ContractFinding)
 class ContractFindingAdmin(admin.ModelAdmin):
     list_display = (
@@ -104,7 +119,7 @@ class ContractFindingAdmin(admin.ModelAdmin):
         "category",
     )
     search_fields = ("title", "risk_summary", "source_quote")
-    raw_id_fields = ("review_run", "source_annotation", "playbook_rule")
+    raw_id_fields = ("review_run", "clause", "source_annotation", "playbook_rule")
     filter_horizontal = ("legal_basis_annotations",)
 
 

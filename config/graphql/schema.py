@@ -60,6 +60,7 @@ from config.graphql import ingestion_admin_types as _ingestion_admin_types
 from config.graphql import ingestion_source_mutations as _ingestion_source_mutations
 from config.graphql import jwt_auth as _jwt_auth
 from config.graphql import label_mutations as _label_mutations
+from config.graphql import legal_review_api as _legal_review_api
 from config.graphql import moderation_mutations as _moderation_mutations
 from config.graphql import notification_mutations as _notification_mutations
 from config.graphql import og_metadata_queries as _og_metadata_queries
@@ -98,6 +99,7 @@ _query_ns.update(_discover_queries.QUERY_FIELDS)
 _query_ns.update(_document_queries.QUERY_FIELDS)
 _query_ns.update(_extract_queries.QUERY_FIELDS)
 _query_ns.update(_ingestion_admin_queries.QUERY_FIELDS)
+_query_ns.update(_legal_review_api.QUERY_FIELDS)
 _query_ns.update(_og_metadata_queries.QUERY_FIELDS)
 _query_ns.update(_pipeline_queries.QUERY_FIELDS)
 _query_ns.update(_research_queries.QUERY_FIELDS)
@@ -128,6 +130,7 @@ _mutation_ns.update(_extract_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_ingestion_source_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_jwt_auth.MUTATION_FIELDS)
 _mutation_ns.update(_label_mutations.MUTATION_FIELDS)
+_mutation_ns.update(_legal_review_api.MUTATION_FIELDS)
 _mutation_ns.update(_moderation_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_notification_mutations.MUTATION_FIELDS)
 _mutation_ns.update(_pipeline_settings_mutations.MUTATION_FIELDS)
@@ -175,6 +178,7 @@ _extra_type_modules = [
     _ingestion_source_mutations,
     _jwt_auth,
     _label_mutations,
+    _legal_review_api,
     _moderation_mutations,
     _notification_mutations,
     _og_metadata_types,
