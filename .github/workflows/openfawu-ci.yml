@@ -1,4 +1,4 @@
-name: openFaWu foundation CI
+name: openFaWu contract review CI
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  foundation:
+  contract-review:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -21,9 +21,15 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Validate Python foundation
+      - name: Validate contract-review backend
         run: |
-          python -m compileall -q opencontractserver/legal_workspace openfawu_codex_bridge
+          python -m compileall -q \
+            config/graphql/legal_review_api.py \
+            opencontractserver/legal_workspace \
+            openfawu_codex_bridge \
+            scripts/openfawu/validate_foundation.py
+          python -m unittest \
+            opencontractserver.legal_workspace.tests.test_contract_text -v
           python -m unittest discover -s openfawu_codex_bridge/tests -v
           python scripts/openfawu/validate_foundation.py
           bash -n scripts/openfawu/codex-bridge-init.sh
@@ -43,7 +49,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Build legal frontend
+      - name: Build contract-review frontend
         run: |
           yarn --cwd frontend install --frozen-lockfile
           yarn --cwd frontend build
