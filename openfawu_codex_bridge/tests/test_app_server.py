@@ -131,6 +131,40 @@ class CodexAppServerClientTest(unittest.TestCase):
             finally:
                 client.stop()
 
+    def test_stop_clears_pending_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "codex-fake"
+            executable.write_text(FAKE_CODEX, encoding="utf-8")
+            executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            config = BridgeConfig(
+                host="127.0.0.1",
+                port=8765,
+                token="abcdefghijklmnopqrstuvwxyz123456",
+                codex_bin=str(executable),
+                allowed_roots=(root,),
+                allowed_origins=("http://localhost:3000",),
+                rpc_timeout_seconds=3,
+            )
+            events = EventStore()
+            client = CodexAppServerClient(config, events)
+            client.ensure_started()
+            client.request(
+                "turn/start",
+                {
+                    "threadId": "thr_fake",
+                    "input": [{"type": "text", "text": "test"}],
+                },
+            )
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not client.pending_requests():
+                time.sleep(0.02)
+            self.assertEqual(client.pending_request_count(), 1)
+            client.stop()
+            self.assertEqual(client.pending_request_count(), 0)
+            methods = [item["method"] for item in events.read(after=0)["events"]]
+            self.assertIn("bridge/approvalExpired", methods)
+
 
 if __name__ == "__main__":
     unittest.main()

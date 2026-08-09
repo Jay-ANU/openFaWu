@@ -210,6 +210,7 @@ class CodexAppServerClient:
                     except OSError:
                         pass
             self._fail_all_pending("Codex app-server 已停止。")
+            self._clear_server_requests("Codex app-server 已停止。")
             self.events.append(kind="bridge", method="bridge/stopped", params={})
 
     def request(
@@ -282,7 +283,17 @@ class CodexAppServerClient:
                 continue
             self._handle_message(message)
         exit_code = process.poll()
-        self._fail_all_pending(f"Codex app-server 已退出，exitCode={exit_code}")
+        # Ignore the reader belonging to an older process after an explicit
+        # restart. Without this identity check, a delayed EOF from the old
+        # process could fail requests already issued to the new app-server.
+        with self._process_lock:
+            if self._process is not process:
+                return
+            self._process = None
+            self._initialize_result = None
+        message = f"Codex app-server 已退出，exitCode={exit_code}"
+        self._fail_all_pending(message)
+        self._clear_server_requests(message)
         self.events.append(
             kind="bridge",
             method="bridge/processExited",
@@ -382,6 +393,23 @@ class CodexAppServerClient:
                 )
             except queue.Full:
                 pass
+
+    def _clear_server_requests(self, reason: str) -> None:
+        with self._server_requests_lock:
+            pending = list(self._server_requests.items())
+            self._server_requests.clear()
+        for request_key, request in pending:
+            self.events.append(
+                kind="bridge",
+                method="bridge/approvalExpired",
+                params={
+                    "requestKey": request_key,
+                    "requestMethod": request.method,
+                    "reason": reason,
+                    "threadId": request.params.get("threadId"),
+                    "turnId": request.params.get("turnId"),
+                },
+            )
 
     def pending_request_count(self) -> int:
         with self._server_requests_lock:

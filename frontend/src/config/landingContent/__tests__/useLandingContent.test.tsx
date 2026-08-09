@@ -33,6 +33,7 @@ const envWith = (variant: string) =>
     REACT_APP_USE_AUTH0: false,
     REACT_APP_USE_ANALYZERS: false,
     REACT_APP_ALLOW_IMPORTS: false,
+    REACT_APP_CODEX_BRIDGE_URL: "http://127.0.0.1:8765",
     REACT_APP_POSTHOG_API_KEY: "",
     REACT_APP_POSTHOG_HOST: "https://us.i.posthog.com",
     REACT_APP_LANDING_VARIANT: variant,

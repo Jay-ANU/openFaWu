@@ -44,8 +44,11 @@ const STORAGE_KEY = "openfawu.codexBridge.settings.v1";
 const Page = styled.main`
   min-height: calc(100dvh - var(--oc-navbar-height, 72px));
   padding: 28px;
-  background:
-    radial-gradient(circle at 78% 0%, rgba(34, 130, 120, 0.14), transparent 30rem),
+  background: radial-gradient(
+      circle at 78% 0%,
+      rgba(34, 130, 120, 0.14),
+      transparent 30rem
+    ),
     #f3f2ee;
   color: #172234;
 
@@ -241,8 +244,8 @@ const Button = styled.button<{ $primary?: boolean; $danger?: boolean }>`
       props.$danger
         ? "rgba(168,57,57,.28)"
         : props.$primary
-          ? "#176c67"
-          : "rgba(23,34,52,.14)"};
+        ? "#176c67"
+        : "rgba(23,34,52,.14)"};
   background: ${(props) =>
     props.$danger ? "#fff5f4" : props.$primary ? "#176c67" : "#fff"};
   color: ${(props) =>
@@ -614,7 +617,10 @@ const itemSummary = (item: JsonObject): { title: string; detail: string } => {
     return { title: "文件修改", detail: jsonPreview(item.changes || item) };
   }
   if (type === "reasoning") {
-    return { title: "执行说明", detail: String(item.summary || "Codex 正在分析任务。") };
+    return {
+      title: "执行说明",
+      detail: String(item.summary || "Codex 正在分析任务。"),
+    };
   }
   return { title: type, detail: jsonPreview(item) };
 };
@@ -650,7 +656,10 @@ export const LocalCodexPage = () => {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
   }, []);
 
-  const updateSetting = <K extends keyof SavedSettings>(key: K, value: SavedSettings[K]) => {
+  const updateSetting = <K extends keyof SavedSettings>(
+    key: K,
+    value: SavedSettings[K]
+  ) => {
     saveSettings({ ...settings, [key]: value });
   };
 
@@ -665,7 +674,9 @@ export const LocalCodexPage = () => {
   }, []);
 
   const refreshPending = useCallback(async () => {
-    const result = await api.get<{ data?: PendingRequest[] }>("/api/v1/requests");
+    const result = await api.get<{ data?: PendingRequest[] }>(
+      "/api/v1/requests"
+    );
     setPendingRequests(Array.isArray(result.data) ? result.data : []);
   }, [api]);
 
@@ -691,7 +702,9 @@ export const LocalCodexPage = () => {
     try {
       await api.post("/api/v1/connect");
       await refreshConnection();
-      const result = await api.get<{ data?: JsonObject[] }>("/api/v1/threads?limit=12");
+      const result = await api.get<{ data?: JsonObject[] }>(
+        "/api/v1/threads?limit=12"
+      );
       setThreads(Array.isArray(result.data) ? result.data : []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "无法连接本地 Codex。");
@@ -705,7 +718,8 @@ export const LocalCodexPage = () => {
       const params = asRecord(event.params);
       if (event.kind === "request" && event.requestKey) {
         setPendingRequests((current) => {
-          if (current.some((item) => item.requestKey === event.requestKey)) return current;
+          if (current.some((item) => item.requestKey === event.requestKey))
+            return current;
           return [
             ...current,
             {
@@ -733,7 +747,9 @@ export const LocalCodexPage = () => {
       }
       if (event.method === "item/agentMessage/delta") {
         const itemId =
-          nestedString(params, "itemId") || nestedString(params, "item", "id") || "agent";
+          nestedString(params, "itemId") ||
+          nestedString(params, "item", "id") ||
+          "agent";
         const delta = typeof params.delta === "string" ? params.delta : "";
         assistantTextRef.current[itemId] =
           (assistantTextRef.current[itemId] || "") + delta;
@@ -745,9 +761,13 @@ export const LocalCodexPage = () => {
         });
         return;
       }
-      if (event.method === "item/completed" || event.method === "item/started") {
+      if (
+        event.method === "item/completed" ||
+        event.method === "item/started"
+      ) {
         const item = asRecord(params.item);
-        const itemId = typeof item.id === "string" ? item.id : `${event.sequence}`;
+        const itemId =
+          typeof item.id === "string" ? item.id : `${event.sequence}`;
         const type = typeof item.type === "string" ? item.type : "";
         if (type === "agentMessage") {
           const text = typeof item.text === "string" ? item.text : "";
@@ -767,7 +787,9 @@ export const LocalCodexPage = () => {
         appendEntry({
           id: `activity-${itemId}`,
           kind: "activity",
-          title: `${summary.title}${event.method.endsWith("started") ? " · 执行中" : ""}`,
+          title: `${summary.title}${
+            event.method.endsWith("started") ? " · 执行中" : ""
+          }`,
           text: summary.detail,
         });
         return;
@@ -805,7 +827,8 @@ export const LocalCodexPage = () => {
             controller.signal
           );
           for (const event of page.events || []) processEvent(event);
-          cursorRef.current = page.cursor ?? page.latestSequence ?? cursorRef.current;
+          cursorRef.current =
+            page.cursor ?? page.latestSequence ?? cursorRef.current;
         } catch (err) {
           if (cancelled) return;
           setError(err instanceof Error ? err.message : "事件流连接中断。");
@@ -821,7 +844,10 @@ export const LocalCodexPage = () => {
   }, [api, processEvent, settings.token, status?.appServerRunning]);
 
   useEffect(() => {
-    chatRef.current?.scrollTo({ top: chatRef.current.scrollHeight, behavior: "smooth" });
+    chatRef.current?.scrollTo({
+      top: chatRef.current.scrollHeight,
+      behavior: "smooth",
+    });
   }, [transcript, pendingRequests]);
 
   const startDeviceLogin = async () => {
@@ -886,12 +912,20 @@ export const LocalCodexPage = () => {
     const value = prompt.trim();
     if (!value || !threadId || activeTurnId) return;
     setPrompt("");
-    appendEntry({ id: `user-${Date.now()}`, kind: "user", text: value, title: "你" });
+    appendEntry({
+      id: `user-${Date.now()}`,
+      kind: "user",
+      text: value,
+      title: "你",
+    });
     setError("");
     try {
       const result = await api.post<JsonObject>(
         `/api/v1/threads/${encodeURIComponent(threadId)}/turns`,
-        { prompt: value, clientUserMessageId: crypto.randomUUID?.() || `${Date.now()}` }
+        {
+          prompt: value,
+          clientUserMessageId: crypto.randomUUID?.() || `${Date.now()}`,
+        }
       );
       const id = nestedString(result, "turn", "id");
       if (id) setActiveTurnId(id);
@@ -904,9 +938,9 @@ export const LocalCodexPage = () => {
     if (!threadId || !activeTurnId) return;
     try {
       await api.post(
-        `/api/v1/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(
-          activeTurnId
-        )}/interrupt`
+        `/api/v1/threads/${encodeURIComponent(
+          threadId
+        )}/turns/${encodeURIComponent(activeTurnId)}/interrupt`
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : "中断任务失败。");
@@ -930,7 +964,8 @@ export const LocalCodexPage = () => {
     nestedString(deviceLogin, "verificationUri") ||
     nestedString(deviceLogin, "verification_url");
   const deviceCode =
-    nestedString(deviceLogin, "userCode") || nestedString(deviceLogin, "user_code");
+    nestedString(deviceLogin, "userCode") ||
+    nestedString(deviceLogin, "user_code");
 
   return (
     <Page>
@@ -943,7 +978,8 @@ export const LocalCodexPage = () => {
             <Title>本地 Codex</Title>
             <Subtitle>
               网页负责法务任务、会话和审批；Codex CLI 使用你本机的 ChatGPT
-              登录、工作目录和沙箱执行。桥接器只监听回环地址，不提供任意 Shell API。
+              登录、工作目录和沙箱执行。桥接器只监听回环地址，不提供任意 Shell
+              API。
             </Subtitle>
           </TitleGroup>
           <StatusChip $ready={connected}>
@@ -966,7 +1002,11 @@ export const LocalCodexPage = () => {
                 <PanelTitle>
                   <Code2 size={17} /> 本机连接
                 </PanelTitle>
-                <IconButton type="button" title="刷新" onClick={() => void refreshConnection()}>
+                <IconButton
+                  type="button"
+                  title="刷新"
+                  onClick={() => void refreshConnection()}
+                >
                   <RefreshCw size={15} />
                 </IconButton>
               </PanelHeader>
@@ -975,7 +1015,9 @@ export const LocalCodexPage = () => {
                   桥接器地址
                   <Input
                     value={settings.baseUrl}
-                    onChange={(event) => updateSetting("baseUrl", event.target.value)}
+                    onChange={(event) =>
+                      updateSetting("baseUrl", event.target.value)
+                    }
                     placeholder="http://127.0.0.1:8765"
                   />
                 </Field>
@@ -985,7 +1027,9 @@ export const LocalCodexPage = () => {
                     <TokenInput
                       type={showToken ? "text" : "password"}
                       value={settings.token}
-                      onChange={(event) => updateSetting("token", event.target.value)}
+                      onChange={(event) =>
+                        updateSetting("token", event.target.value)
+                      }
                       placeholder="make -f openfawu.mk codex-token"
                       autoComplete="off"
                     />
@@ -999,7 +1043,12 @@ export const LocalCodexPage = () => {
                   </TokenWrap>
                 </Field>
                 <ButtonRow>
-                  <Button $primary type="button" disabled={busy} onClick={() => void connect()}>
+                  <Button
+                    $primary
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void connect()}
+                  >
                     <Play size={15} /> 连接 Codex
                   </Button>
                   <Button
@@ -1011,7 +1060,9 @@ export const LocalCodexPage = () => {
                         await api.post("/api/v1/restart");
                         await refreshConnection();
                       } catch (err) {
-                        setError(err instanceof Error ? err.message : "重启失败。");
+                        setError(
+                          err instanceof Error ? err.message : "重启失败。"
+                        );
                       } finally {
                         setBusy(false);
                       }
@@ -1021,7 +1072,8 @@ export const LocalCodexPage = () => {
                   </Button>
                 </ButtonRow>
                 <SmallNote>
-                  初始化命令：<code>make -f openfawu.mk codex-init</code>；启动命令：
+                  初始化命令：<code>make -f openfawu.mk codex-init</code>
+                  ；启动命令：
                   <code>make -f openfawu.mk codex-bridge</code>。
                 </SmallNote>
 
@@ -1030,18 +1082,23 @@ export const LocalCodexPage = () => {
                   <StatusRow>
                     Codex CLI
                     <StatusValue $ok={status?.codexAvailable}>
-                      {status?.codexVersion || (status?.codexAvailable ? "已安装" : "未检测到")}
+                      {status?.codexVersion ||
+                        (status?.codexAvailable ? "已安装" : "未检测到")}
                     </StatusValue>
                   </StatusRow>
                   <StatusRow>
                     App Server
                     <StatusValue $ok={status?.appServerRunning}>
-                      {status?.appServerRunning ? `PID ${status.appServerPid}` : "未启动"}
+                      {status?.appServerRunning
+                        ? `PID ${status.appServerPid}`
+                        : "未启动"}
                     </StatusValue>
                   </StatusRow>
                   <StatusRow>
                     ChatGPT 账户
-                    <StatusValue $ok={Boolean(account)}>{readableAccount(account)}</StatusValue>
+                    <StatusValue $ok={Boolean(account)}>
+                      {readableAccount(account)}
+                    </StatusValue>
                   </StatusRow>
                   <StatusRow>
                     待审批
@@ -1067,7 +1124,13 @@ export const LocalCodexPage = () => {
                     {deviceUrl && (
                       <Button
                         type="button"
-                        onClick={() => window.open(deviceUrl, "_blank", "noopener,noreferrer")}
+                        onClick={() =>
+                          window.open(
+                            deviceUrl,
+                            "_blank",
+                            "noopener,noreferrer"
+                          )
+                        }
                       >
                         <ExternalLink size={14} /> 打开登录页面
                       </Button>
@@ -1078,7 +1141,8 @@ export const LocalCodexPage = () => {
                 <SafetyBox>
                   <strong>安全边界</strong>
                   <br />
-                  只允许配置根目录内的工作区；只开放 read-only 和 workspace-write；命令及文件改动由网页逐项确认；没有“关闭沙箱”按钮。
+                  只允许配置根目录内的工作区；只开放 read-only 和
+                  workspace-write；命令及文件改动由网页逐项确认；没有“关闭沙箱”按钮。
                 </SafetyBox>
               </PanelBody>
             </Panel>
@@ -1094,8 +1158,12 @@ export const LocalCodexPage = () => {
                   本地工作目录
                   <Input
                     value={settings.cwd}
-                    onChange={(event) => updateSetting("cwd", event.target.value)}
-                    placeholder={status?.allowedRoots?.[0] || "~/.openfawu/workspaces"}
+                    onChange={(event) =>
+                      updateSetting("cwd", event.target.value)
+                    }
+                    placeholder={
+                      status?.allowedRoots?.[0] || "~/.openfawu/workspaces"
+                    }
                   />
                 </Field>
                 <Field>
@@ -1110,7 +1178,9 @@ export const LocalCodexPage = () => {
                     }
                   >
                     <option value="read-only">只读：分析与检索</option>
-                    <option value="workspace-write">工作区写入：生成和修改文件</option>
+                    <option value="workspace-write">
+                      工作区写入：生成和修改文件
+                    </option>
                   </Select>
                 </Field>
                 <Field>
@@ -1132,11 +1202,18 @@ export const LocalCodexPage = () => {
                   模型（留空使用 Codex 默认）
                   <Input
                     value={settings.model}
-                    onChange={(event) => updateSetting("model", event.target.value)}
+                    onChange={(event) =>
+                      updateSetting("model", event.target.value)
+                    }
                     placeholder="留空"
                   />
                 </Field>
-                <Button $primary type="button" disabled={!connected || busy} onClick={() => void startThread()}>
+                <Button
+                  $primary
+                  type="button"
+                  disabled={!connected || busy}
+                  onClick={() => void startThread()}
+                >
                   <TerminalSquare size={15} /> 新建法务会话
                 </Button>
 
@@ -1146,13 +1223,18 @@ export const LocalCodexPage = () => {
                     <SmallNote>最近的本地 Codex 会话</SmallNote>
                     <ThreadList>
                       {threads.slice(0, 8).map((thread) => {
-                        const id = typeof thread.id === "string" ? thread.id : "";
+                        const id =
+                          typeof thread.id === "string" ? thread.id : "";
                         const preview =
                           typeof thread.preview === "string" && thread.preview
                             ? thread.preview
                             : id;
                         return (
-                          <ThreadButton key={id} type="button" onClick={() => void resumeThread(id)}>
+                          <ThreadButton
+                            key={id}
+                            type="button"
+                            onClick={() => void resumeThread(id)}
+                          >
                             <span>{preview.slice(0, 46)}</span>
                             <ChevronRight size={14} />
                           </ThreadButton>
@@ -1176,7 +1258,11 @@ export const LocalCodexPage = () => {
               </SessionMeta>
               <ButtonRow>
                 {activeTurnId && (
-                  <Button $danger type="button" onClick={() => void interrupt()}>
+                  <Button
+                    $danger
+                    type="button"
+                    onClick={() => void interrupt()}
+                  >
                     <CircleStop size={15} /> 中断当前任务
                   </Button>
                 )}
@@ -1201,8 +1287,14 @@ export const LocalCodexPage = () => {
                         ? request.params.command
                         : "";
                     const cwd =
-                      typeof request.params.cwd === "string" ? request.params.cwd : "";
-                    const fileChanges = request.params.fileChanges || request.params.changes;
+                      typeof request.params.cwd === "string"
+                        ? request.params.cwd
+                        : "";
+                    const fileChanges =
+                      request.params.fileChanges ?? request.params.changes;
+                    const approvalDetail =
+                      command ||
+                      (fileChanges != null ? jsonPreview(fileChanges) : "");
                     return (
                       <ApprovalCard key={request.requestKey}>
                         <ApprovalTitle>
@@ -1212,18 +1304,20 @@ export const LocalCodexPage = () => {
                             : "Codex 请求执行命令"}
                         </ApprovalTitle>
                         {cwd && <SmallNote>目录：{cwd}</SmallNote>}
-                        {(command || fileChanges) && (
-                          <Mono>{command || jsonPreview(fileChanges)}</Mono>
-                        )}
+                        {approvalDetail ? <Mono>{approvalDetail}</Mono> : null}
                         {!request.supported && (
-                          <SmallNote>该请求类型尚未由安全桥接器支持。</SmallNote>
+                          <SmallNote>
+                            该请求类型尚未由安全桥接器支持。
+                          </SmallNote>
                         )}
                         <ButtonRow style={{ marginTop: 12 }}>
                           <Button
                             $primary
                             type="button"
                             disabled={!request.supported}
-                            onClick={() => void decide(request.requestKey, "accept")}
+                            onClick={() =>
+                              void decide(request.requestKey, "accept")
+                            }
                           >
                             <Check size={14} /> 允许一次
                           </Button>
@@ -1232,7 +1326,10 @@ export const LocalCodexPage = () => {
                               type="button"
                               disabled={!request.supported}
                               onClick={() =>
-                                void decide(request.requestKey, "acceptForSession")
+                                void decide(
+                                  request.requestKey,
+                                  "acceptForSession"
+                                )
                               }
                             >
                               <ShieldCheck size={14} /> 本会话允许
@@ -1242,7 +1339,9 @@ export const LocalCodexPage = () => {
                             $danger
                             type="button"
                             disabled={!request.supported}
-                            onClick={() => void decide(request.requestKey, "decline")}
+                            onClick={() =>
+                              void decide(request.requestKey, "decline")
+                            }
                           >
                             <X size={14} /> 拒绝
                           </Button>
@@ -1261,7 +1360,8 @@ export const LocalCodexPage = () => {
                     </EmptyIcon>
                     {threadId ? (
                       <>
-                        输入一个法务任务。Codex 可以读取当前工作目录、整理证据、生成报告文件，写入和命令执行仍受沙箱与审批约束。
+                        输入一个法务任务。Codex
+                        可以读取当前工作目录、整理证据、生成报告文件，写入和命令执行仍受沙箱与审批约束。
                       </>
                     ) : (
                       <>先连接桥接器并创建一个会话。</>
@@ -1279,7 +1379,10 @@ export const LocalCodexPage = () => {
                     </ActivityCard>
                   ) : (
                     <Message key={entry.id} $user={entry.kind === "user"}>
-                      <MessageMeta>{entry.title || (entry.kind === "user" ? "你" : "Codex")}</MessageMeta>
+                      <MessageMeta>
+                        {entry.title ||
+                          (entry.kind === "user" ? "你" : "Codex")}
+                      </MessageMeta>
                       {entry.text}
                     </Message>
                   )
@@ -1300,12 +1403,16 @@ export const LocalCodexPage = () => {
               />
               <ComposerFooter>
                 <SmallNote style={{ margin: 0 }}>
-                  {activeTurnId ? "Codex 正在执行；可中断或处理上方审批。" : "Enter 换行，点击发送提交任务。"}
+                  {activeTurnId
+                    ? "Codex 正在执行；可中断或处理上方审批。"
+                    : "Enter 换行，点击发送提交任务。"}
                 </SmallNote>
                 <Button
                   $primary
                   type="submit"
-                  disabled={!threadId || !prompt.trim() || Boolean(activeTurnId)}
+                  disabled={
+                    !threadId || !prompt.trim() || Boolean(activeTurnId)
+                  }
                 >
                   <Send size={15} /> 发送任务
                 </Button>
