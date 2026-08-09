@@ -1,0 +1,36 @@
+# Common, CPU-safe service override for the accelerated parser and embedder.
+#
+# This file deliberately contains no host device mounts. Merge exactly one
+# vendor overlay after it to enable hardware acceleration:
+#
+#   compose/accelerated/accel.cpu.yml
+#   compose/accelerated/accel.intel.yml
+#   compose/accelerated/accel.nvidia.yml
+#   compose/accelerated/accel.amd.yml
+#
+# Intel hosts with an NPU may additionally merge accel.intel-npu.yml. Keeping
+# NPU passthrough separate lets the Intel GPU overlay work on hosts where
+# /dev/accel does not exist. The common override by itself is a valid CPU
+# deployment and is also the safe fallback when no vendor overlay is selected.
+
+services:
+  docling-parser:
+    image: oc-docling:cpu
+    build:
+      context: ./compose/accelerated
+      dockerfile: docling/Dockerfile
+      args:
+        ACCEL: cpu
+    environment:
+      DOCLING_ACCEL: ${DOCLING_ACCEL:-auto}
+
+  vector-embedder:
+    image: oc-embedder:cpu
+    build:
+      context: ./compose/accelerated
+      dockerfile: embedder/Dockerfile
+      args:
+        ACCEL: cpu
+    environment:
+      EMBED_ACCEL: ${EMBED_ACCEL:-auto}
+      VECTOR_EMBEDDER_API_KEY: ${VECTOR_EMBEDDER_API_KEY:-abc123}

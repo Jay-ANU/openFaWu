@@ -1,0 +1,374 @@
+volumes:
+  local_postgres_data: {}
+  local_postgres_data_backups: {}
+
+services:
+  django: &django
+    build:
+      context: .
+      args:
+        - GITHUB_ACTIONS
+      dockerfile: ./compose/local/django/Dockerfile
+      # Pull pre-built layers from ghcr (populated by the backend CI on every
+      # main-branch push — see .github/workflows/backend.yml). Cuts a fresh
+      # ``docker compose -f local.yml build`` from ~5-10 min to ~30-60 s on
+      # cache hit. Requires ``DOCKER_BUILDKIT=1`` (default in modern docker)
+      # and authentication to ghcr.io:
+      #   echo $GITHUB_TOKEN | docker login ghcr.io -u <username> --password-stdin
+      # or (with the GitHub CLI):
+      #   gh auth token | docker login ghcr.io -u <username> --password-stdin
+      # The cache image is public — auth is only needed if your docker is not
+      # already logged into ghcr; an unauthenticated pull falls back gracefully
+      # (cache miss, builds from scratch).
+      cache_from:
+        - type=registry,ref=ghcr.io/open-source-legal/opencontracts/django-local-cache:main
+    image: opencontractserver_local_django
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vector-embedder:
+        condition: service_started
+      multimodal-embedder:
+        condition: service_started
+      docling-parser:
+        condition: service_started
+      docxodus-parser:
+        condition: service_started
+        required: false
+      privacy_filter:
+        condition: service_started
+        required: false
+      gotenberg:
+        condition: service_started
+        required: false
+      warp-ingest:
+        condition: service_started
+        required: false
+    volumes:
+      - .:/app:z
+    env_file:
+      - ./.envs/.local/.django
+      - ./.envs/.local/.postgres
+    environment:
+      # Forwarded from the host so CI / local repro runs can flip on
+      # cassette record / replay without editing the env files. The
+      # WebSocket consumer (UnifiedAgentConsumer) runs the LLM agent
+      # in-process here under Daphne, so the django service needs the
+      # same VCR wiring as celeryworker (which handles task-side runs).
+      # See opencontractserver/utils/vcr_replay.py.
+      OC_LLM_VCR_MODE: ${OC_LLM_VCR_MODE-}
+      OC_LLM_VCR_CASSETTE: ${OC_LLM_VCR_CASSETTE-}
+      OC_LLM_VCR_DEBUG: ${OC_LLM_VCR_DEBUG-}
+    ports:
+      - "8000:8000"
+    command: /start
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://localhost:8000/admin/login/\")'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    # Hard cap — see docling-parser's mem_limit comment. This
+    # container also hosts ad-hoc ``docker compose exec`` management
+    # commands (bulk enrichment/backfill scripts), which share its cgroup —
+    # sized to cover the ASGI server plus one such batch job comfortably.
+    # A host-wide OOM (not just a single-container one) forced a hard
+    # reboot when several uncapped services (this one included) grew
+    # unchecked at the same time as capped ones under concurrent load; this
+    # cap plus matching caps on postgres/redis/gotenberg/multimodal-embedder/
+    # docxodus-parser close that gap.
+    mem_limit: 8g
+    restart: unless-stopped
+
+  postgres:
+    build:
+      context: .
+      dockerfile: ./compose/production/postgres/Dockerfile
+    container_name: postgres
+    image: opencontractserver_production_postgres
+    shm_size: '2g'
+    volumes:
+      - local_postgres_data:/var/lib/postgresql/data:Z
+      - local_postgres_data_backups:/backups:z
+    env_file:
+      - ./.envs/.local/.postgres
+    # Shared settings (shared_preload_libraries, HNSW, I/O tuning) are in
+    # compose/postgres/shared.conf and injected by docker-entrypoint-wrapper.sh.
+    # Only per-environment memory settings remain here.
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=2GB
+      -c work_mem=16MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # Hard cap — see docling-parser's mem_limit comment. Postgres
+    # crash-recovers cleanly via WAL replay on restart, so capping it is
+    # safe from a durability standpoint, not just a memory one.
+    mem_limit: 4g
+    restart: unless-stopped
+
+  redis:
+    image: redis:6
+    container_name: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    # Hard cap — see docling-parser's mem_limit comment.
+    mem_limit: 2g
+    restart: unless-stopped
+
+  docling-parser:
+    image: jscrudato/docsling-local
+    container_name: docling-parser
+    # Hard cap so a runaway parse (or unreleased memory across many requests)
+    # gets this ONE container OOM-killed by the kernel cgroup instead of
+    # exhausting host RAM/swap and taking down unrelated host processes
+    # (observed: a long bulk-ingest run drove host-wide OOM that killed
+    # user desktop apps before any per-container limit existed here).
+    mem_limit: 4g
+    # If sustained load ever legitimately pushes this past the cap, let the
+    # cgroup OOM-kill it and have compose bring it straight back up rather
+    # than leaving the pipeline silently stuck on a dead parser.
+    restart: unless-stopped
+
+  docxodus-parser:
+    # The frontend WASM (docxodus in package.json) and this microservice
+    # must use the same Docxodus version for character offset alignment.
+    image: ghcr.io/open-source-legal/docxodus-service:1.1.0-docxodus5.4.2
+    container_name: docxodus-parser
+    # Hard cap — see docling-parser's mem_limit comment.
+    mem_limit: 1g
+    restart: unless-stopped
+
+  # Optional alternative PDF parser (deterministic, rule-based; renders straight
+  # to the OpenContracts format). Opt-in via the "warp-ingest" compose profile:
+  #   docker compose -f local.yml --profile warp-ingest up
+  # Then select "Warp-Ingest Parser (REST)" for PDFs in the admin System Settings
+  # UI. WARP_API_KEY is shared with the WARP_INGEST_API_KEY the django client
+  # sends (set it in your env so both sides agree; defaults to warp-ingest's own
+  # "abc123" fallback). The ~2.5 GB image is why this is behind a profile.
+  warp-ingest:
+    # Pinned (not :latest): Warp-Ingest's value proposition is *deterministic*
+    # output, so a floating tag could silently change parse results without an
+    # OpenContracts version bump. Mirrors docxodus-parser's exact-version pin.
+    image: ghcr.io/open-source-legal/warp-ingest:1.0.0
+    container_name: warp-ingest
+    profiles:
+      - warp-ingest
+    ports:
+      - "5001:5001"
+    environment:
+      - WARP_API_KEY=${WARP_INGEST_API_KEY:-abc123}
+    # Hard cap — see docling-parser's mem_limit comment. Warp-Ingest's
+    # own memory model (docs/pipelines/warp_ingest_parser.md) documents
+    # peak-per-request scaling with file size, but a long bulk run observed
+    # sustained growth to ~5.7GB that emptied out on restart (unreturned
+    # memory, not legitimate working set), so this cap is set above that
+    # observed peak — high enough to avoid recycling on normal operation,
+    # low enough to keep a runaway well short of exhausting host RAM/swap.
+    mem_limit: 6g
+    restart: unless-stopped
+
+  # Powers the optional pre-parse file-to-PDF converter
+  # (GotenbergFileConverter). Enable it by setting the converter in the admin
+  # System Settings UI (or DEFAULT_FILE_CONVERTER env var). No host port
+  # mapping: gotenberg listens on 3000 internally (would collide with the
+  # frontend dev server's 3000), and django/celeryworker reach it over the
+  # docker bridge at http://gotenberg:3000. No healthcheck: the stock image
+  # ships neither curl nor python (matching docling/docxodus, dependents use
+  # condition: service_started).
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: gotenberg
+    # Hard cap — see docling-parser's mem_limit comment.
+    mem_limit: 2g
+    restart: unless-stopped
+
+  # The embedder images read VECTOR_EMBEDDER_API_KEY (compose/accelerated/
+  # embedder/main.py), NOT API_KEY — the old ``API_KEY`` key was silently ignored
+  # (the image fell back to its built-in "abc123" default, which happened to
+  # match the abc123 in .envs/.local/.django, so overrides never took effect).
+  # Source each service's key from the SAME host var Django uses to call it
+  # (VECTOR_/MULTIMODAL_EMBEDDER_API_KEY in .envs/.local/.django) so an override
+  # stays in sync on both sides. The abc123 fallback is a LOCAL DEVELOPMENT ONLY
+  # placeholder — override before exposing these services off the docker bridge.
+  vector-embedder:
+    image: ghcr.io/jsv4/vectorembeddermicroservice:latest
+    container_name: vector-embedder
+    environment:
+      PORT: 8000
+      TRANSFORMERS_OFFLINE: 1
+      HF_DATASETS_OFFLINE: 1
+      VECTOR_EMBEDDER_API_KEY: ${VECTOR_EMBEDDER_API_KEY:-abc123}
+    # Hard cap — see docling-parser's mem_limit comment.
+    mem_limit: 4g
+    restart: unless-stopped
+
+  multimodal-embedder:
+    image: ghcr.io/jsv4/vectorembeddermicroservice-multimodal:latest
+    container_name: multimodal-embedder
+    environment:
+      PORT: 8000
+      TRANSFORMERS_OFFLINE: 1
+      HF_DATASETS_OFFLINE: 1
+      # This image reads VECTOR_EMBEDDER_API_KEY (same as vector-embedder), but
+      # source it from the DIFFERENT host var MULTIMODAL_EMBEDDER_API_KEY -- the
+      # one Django uses to call the multimodal service. Do not "fix" this to read
+      # VECTOR_EMBEDDER_API_KEY like vector-embedder above or multimodal auth
+      # will silently desync from the Django side.
+      VECTOR_EMBEDDER_API_KEY: ${MULTIMODAL_EMBEDDER_API_KEY:-abc123}
+    # Hard cap — see docling-parser's mem_limit comment.
+    mem_limit: 2g
+    restart: unless-stopped
+
+  # API_KEYS value below is a LOCAL DEVELOPMENT ONLY placeholder; override via
+  # environment / .env before exposing the service outside the local docker
+  # bridge. The image bakes the model weights and runs CPU-only.
+  # No ``ports`` mapping: reachable only over the docker bridge from django /
+  # celeryworker (which is the only intended access pattern). To smoke-test
+  # from the host, exec into the django container and curl
+  # ``http://privacy_filter:8000/v1/detect``.
+  privacy_filter:
+    image: ghcr.io/open-source-legal/privacy-filter:latest
+    container_name: privacy_filter
+    environment:
+      API_KEYS: dev-only-not-secret
+      MAX_INPUT_CHARS: "50000"
+      CORS_ORIGINS: ""
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)\""
+      interval: 10s
+      retries: 5
+      start_period: 20s
+    # Hard cap — see docling-parser's mem_limit comment. CPU-only model
+    # inference with baked weights; bounded input (MAX_INPUT_CHARS) keeps
+    # per-request growth small, the cap contains any leak across requests.
+    mem_limit: 2g
+    restart: unless-stopped
+
+  celeryworker:
+    image: opencontractserver_local_django
+    container_name: celeryworker
+    # Hard cap — see docling-parser's mem_limit comment. This service
+    # definition is also the base for ad-hoc bulk workers launched via
+    # ``docker compose run --name celeryworker_bulk -d celeryworker ...``
+    # (higher concurrency, long-running ingest batches), which inherits this
+    # limit the same way. Sized above the parser/embedder caps since this
+    # container buffers file bytes and ORM state across many concurrent
+    # tasks, not just one model's working set.
+    mem_limit: 6g
+    restart: unless-stopped
+    depends_on:
+      django:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      docling-parser:
+        condition: service_started
+      docxodus-parser:
+        condition: service_started
+        required: false
+      privacy_filter:
+        condition: service_started
+        required: false
+      gotenberg:
+        condition: service_started
+        required: false
+      warp-ingest:
+        condition: service_started
+        required: false
+    volumes:
+      - .:/app:z
+    env_file:
+      - ./.envs/.local/.django
+      - ./.envs/.local/.postgres
+    environment:
+      # Optional VCR.py wrapper for the LLM agent in doc_extract_query_task.
+      # Forwarded from the host so CI / local repro runs can flip on
+      # cassette record / replay without editing the env files. See
+      # opencontractserver/utils/vcr_replay.py.
+      OC_LLM_VCR_MODE: ${OC_LLM_VCR_MODE-}
+      OC_LLM_VCR_CASSETTE: ${OC_LLM_VCR_CASSETTE-}
+      OC_LLM_VCR_DEBUG: ${OC_LLM_VCR_DEBUG-}
+    command: /app/compose/local/django/celery/worker/start
+
+
+  celerybeat:
+    image: opencontractserver_local_django
+    container_name: celerybeat
+    depends_on:
+      django:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      docling-parser:
+        condition: service_started
+      docxodus-parser:
+        condition: service_started
+        required: false
+    volumes:
+      - .:/app:z
+    env_file:
+      - ./.envs/.local/.django
+      - ./.envs/.local/.postgres
+    command: /start-celerybeat
+    # Hard cap — see docling-parser's mem_limit comment. The beat scheduler
+    # only enqueues tasks (no task bodies run here), so its footprint is small.
+    mem_limit: 1g
+    restart: unless-stopped
+
+  flower:
+    <<: *django
+    image: opencontractserver_local_flower
+    container_name: flower
+    depends_on:
+      django:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "5555:5555"
+    command: /start-flower
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5555/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+      build:
+        context: ./frontend
+        dockerfile: ./Dockerfile
+      image: opencontractserver_local_frontend
+      container_name: frontend
+      depends_on:
+        - django
+      env_file:
+      - ./.envs/.local/.frontend
+      ports:
+        - "3000:3000"
+      profiles:
+        - "fullstack"
+      # Hard cap — see docling-parser's mem_limit comment. Profile-gated dev
+      # tooling, but a Vite dev server can still balloon under HMR churn.
+      mem_limit: 2g
+      restart: unless-stopped

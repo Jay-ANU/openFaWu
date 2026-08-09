@@ -1,0 +1,2208 @@
+"""Service layer for :class:`ResearchReport`.
+
+All ResearchReport mutations and lifecycle transitions go through this
+class. Per CLAUDE.md rule 7, callers with user context (GraphQL,
+Celery, chat tools) MUST NOT touch ``ResearchReport.objects`` directly.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Sequence
+from datetime import timedelta
+from difflib import SequenceMatcher
+from typing import Any, NamedTuple
+
+from django.conf import settings
+from django.db import transaction
+from django.utils import timezone
+
+from opencontractserver.research.constants import (
+    DEFAULT_MAX_STEPS_FALLBACK,
+    MAX_RESEARCH_MEMORY_KEY_CHARS,
+    MAX_RESEARCH_MEMORY_KEYS,
+    MAX_RESEARCH_MEMORY_TOTAL_CHARS,
+    MAX_RESEARCH_MEMORY_VALUE_CHARS,
+    MAX_RESEARCH_PLAN_CHARS,
+    MAX_RESEARCH_STEPS_CEILING,
+    RESEARCH_CITE_ECHO_THRESHOLD,
+    RESEARCH_CLAIM_INVERSION_COVERAGE,
+    RESEARCH_CLAIM_SUPPORT_MIN_COVERAGE,
+    RESEARCH_CLAIM_SUPPORT_MIN_WORDS,
+    RESEARCH_HEADER_ANCHOR_LABELS,
+    RESEARCH_MEMORY_PREVIEW_CHARS,
+    RESEARCH_MEMORY_SEARCH_MAX_HITS,
+    RESEARCH_QUOTE_MATCH_THRESHOLD,
+    RESEARCH_QUOTE_MAX_CHARS,
+    RESEARCH_QUOTE_MIN_WORDS,
+    RESEARCH_RECOVERY_FINDINGS_DIGEST,
+    RESEARCH_SENTENCE_LOOKBACK_CHARS,
+    RESEARCH_SUMMARY_DUPLICATE_PROBE_CHARS,
+    RESEARCH_SUMMARY_DUPLICATE_THRESHOLD,
+    RESEARCH_SUPPORT_MIN_TOKEN_CHARS,
+    RESEARCH_SUPPORT_NEGATION_PREFIXES,
+    RESEARCH_SUPPORT_NEGATION_TOKENS,
+    RESEARCH_SUPPORT_STOPWORDS,
+    RESEARCH_WORKSPACE_FOLDER,
+)
+from opencontractserver.research.models import ResearchReport
+from opencontractserver.shared.services.base import BaseService
+from opencontractserver.types.enums import JobStatus, PermissionTypes
+
+logger = logging.getLogger(__name__)
+
+
+class ResearchCancelled(Exception):
+    """Raised inside the agent loop when the user has requested cancel.
+
+    The Celery task boundary catches this and transitions the report to
+    :class:`JobStatus.CANCELLED` while preserving any partial findings.
+    """
+
+
+class ConcurrentResearchInProgress(Exception):
+    """Raised when a user tries to start a second concurrent job for the
+    same corpus inside the concurrency-guard window."""
+
+
+class ResearchMemoryError(Exception):
+    """Base for anything the memory-write path rejects — both malformed input
+    (empty key, unknown mode) and capacity violations.
+
+    The agent-bound ``write_memory`` closure catches this base class and returns
+    the message to the model as an operational error string (mirroring
+    ``record_finding``'s bad-id handling) so the run continues — the agent is
+    expected to fix the input, prune, or shorten and retry rather than crash the
+    job. Catch the base when you only need "the write was rejected, tell the
+    model"; catch :class:`ResearchMemoryLimitExceeded` specifically to
+    distinguish a genuine cap violation from bad input.
+    """
+
+
+class ResearchMemoryLimitExceeded(ResearchMemoryError):
+    """Raised when a numeric cap (per-key, per-value, total-store, or key-count)
+    would be exceeded — a capacity violation, not malformed input."""
+
+
+class ResearchReportService(BaseService):
+    """Canonical entry point for ResearchReport CRUD + lifecycle."""
+
+    # ------------------------------------------------------------------
+    # Kickoff
+    # ------------------------------------------------------------------
+    @classmethod
+    def start(
+        cls,
+        *,
+        user: Any,
+        corpus: Any,
+        prompt: str,
+        title: str | None = None,
+        conversation: Any = None,
+        originating_message: Any = None,
+        max_steps: int | None = None,
+        corpus_group: Any = None,
+        request: Any = None,
+    ) -> ResearchReport:
+        """Create a QUEUED ResearchReport and enqueue the Celery task.
+
+        ``corpus_group`` optionally widens retrieval beyond the anchor corpus.
+        It is gated separately and by the *same* user: a group the caller
+        cannot see is refused rather than silently ignored, because silently
+        narrowing the scope would produce a report that looks group-wide and
+        is not.
+
+        Raises:
+            PermissionError: when ``user`` lacks READ on ``corpus``, or the
+                requested group is not visible to them.
+            ConcurrentResearchInProgress: when a non-terminal report for
+                the same ``(user, corpus)`` exists inside the configured
+                concurrency-guard window.
+        """
+        error = cls.require_permission(
+            corpus, user, PermissionTypes.READ, request=request
+        )
+        if error:
+            raise PermissionError(error)
+
+        if corpus_group is not None:
+            from opencontractserver.corpuses.services import CorpusGroupService
+
+            visible = (
+                CorpusGroupService.list_visible_groups(user)
+                .filter(pk=corpus_group.pk)
+                .exists()
+            )
+            if not visible:
+                raise PermissionError(
+                    "Corpus group not found or not visible to this user."
+                )
+
+        default_max_steps: int = getattr(
+            settings, "DEEP_RESEARCH_DEFAULT_MAX_STEPS", DEFAULT_MAX_STEPS_FALLBACK
+        )
+        resolved_max_steps: int = (
+            int(max_steps) if max_steps is not None else default_max_steps
+        )
+        # Hard ceiling so a user-supplied ``max_steps`` can't burn an
+        # unbounded LLM budget. ``max(1, ...)`` keeps a floor so callers
+        # can't queue a zero-budget run that would no-op immediately.
+        resolved_max_steps = max(1, min(resolved_max_steps, MAX_RESEARCH_STEPS_CEILING))
+        resolved_title = title or _derive_title_from_prompt(prompt)
+
+        guard_seconds = getattr(
+            settings, "DEEP_RESEARCH_CONCURRENCY_GUARD_SECONDS", 3600
+        )
+        cutoff = timezone.now() - timedelta(seconds=guard_seconds)
+        active_states = (JobStatus.QUEUED.value, JobStatus.RUNNING.value)
+
+        # Single atomic block + ``select_for_update`` so the
+        # concurrency-guard check and the row insert are serialised
+        # against concurrent ``start()`` calls for the same
+        # ``(creator, corpus)`` — closes the TOCTOU window where two
+        # requests can both pass ``.exists()`` before either creates a
+        # row. The ``select_for_update`` here locks at most a single row
+        # (the most recent active report for this user+corpus), so it is
+        # cheap even on a hot corpus.
+        with transaction.atomic():
+            active_for_pair = (
+                ResearchReport.objects.select_for_update()
+                .filter(
+                    creator=user,
+                    corpus=corpus,
+                    status__in=active_states,
+                    created__gte=cutoff,
+                )
+                .order_by("-created")
+                .first()
+            )
+            if active_for_pair is not None:
+                raise ConcurrentResearchInProgress(
+                    "You already have a research job queued or running on "
+                    "this corpus. Wait for it to finish or cancel it before "
+                    "starting another."
+                )
+            report = ResearchReport.objects.create(
+                creator=user,
+                corpus=corpus,
+                prompt=prompt,
+                title=resolved_title,
+                status=JobStatus.QUEUED.value,
+                max_steps=resolved_max_steps,
+                conversation=conversation,
+                originating_message=originating_message,
+                corpus_group=corpus_group,
+            )
+
+            # Enqueue the Celery task. Local import keeps the service free
+            # of a hard dependency on Celery / agent code at import time
+            # (so a bare ``python manage.py shell`` can construct rows).
+            from opencontractserver.tasks.research_tasks import run_deep_research
+
+            transaction.on_commit(lambda: run_deep_research.delay(report.pk))
+
+        cls.log_action("Started", report, user, corpus_id=corpus.pk)
+        return report
+
+    # ------------------------------------------------------------------
+    # Reads
+    # ------------------------------------------------------------------
+    @classmethod
+    def list_recent_for_corpus(
+        cls,
+        *,
+        user: Any,
+        corpus: Any,
+        limit: int = 5,
+        request: Any = None,
+    ) -> list[ResearchReport]:
+        """Return the user's most recent reports for ``corpus`` (newest first).
+
+        Creator-only visibility is enforced by ``visible_to_user`` (via the
+        shared ``filter_visible`` helper), so this is safe to expose to chat
+        tools and other user-context callers. ``limit`` is clamped to a small
+        ceiling so a caller cannot pull an unbounded list.
+        """
+        bounded = max(1, min(int(limit), 25))
+        qs = (
+            cls.filter_visible(ResearchReport, user, request=request)
+            .filter(corpus=corpus)
+            .order_by("-created")
+        )
+        return list(qs[:bounded])
+
+    # ------------------------------------------------------------------
+    # Lifecycle transitions
+    # ------------------------------------------------------------------
+    @classmethod
+    def mark_started(cls, report: ResearchReport, *, resuming: bool = False) -> None:
+        """Transition a report to RUNNING.
+
+        On a resume (``resuming=True``, i.e. a worker picking up a report that
+        was already RUNNING after a crash) the original ``started_at`` is
+        preserved so wall-clock duration reflects the whole investigation, not
+        just the final leg. ``error_message`` is still cleared — a prior
+        transient error should not shadow a successful resume.
+        """
+        now = timezone.now()
+        report.status = JobStatus.RUNNING.value
+        if not (resuming and report.started_at):
+            report.started_at = now
+        report.last_progress_at = now
+        report.error_message = ""
+        report.save(
+            update_fields=[
+                "status",
+                "started_at",
+                "last_progress_at",
+                "error_message",
+                "modified",
+            ]
+        )
+
+    @classmethod
+    def mark_progress(cls, report: ResearchReport) -> None:
+        report.last_progress_at = timezone.now()
+        report.save(update_fields=["last_progress_at", "modified"])
+
+    @classmethod
+    def mark_completed(
+        cls,
+        report: ResearchReport,
+        *,
+        warnings: list[str] | None = None,
+        model_usage: dict | None = None,
+    ) -> None:
+        report.status = JobStatus.COMPLETED.value
+        report.completed_at = timezone.now()
+        report.last_progress_at = report.completed_at
+        if warnings:
+            report.warnings = list(report.warnings or []) + warnings
+        if model_usage:
+            report.model_usage = {**(report.model_usage or {}), **model_usage}
+        report.save(
+            update_fields=[
+                "status",
+                "completed_at",
+                "last_progress_at",
+                "warnings",
+                "model_usage",
+                "modified",
+            ]
+        )
+
+    @classmethod
+    def mark_failed(cls, report: ResearchReport, error: str) -> None:
+        report.status = JobStatus.FAILED.value
+        report.completed_at = timezone.now()
+        report.last_progress_at = report.completed_at
+        report.error_message = (error or "")[:4000]
+        report.save(
+            update_fields=[
+                "status",
+                "completed_at",
+                "last_progress_at",
+                "error_message",
+                "modified",
+            ]
+        )
+
+    @classmethod
+    def mark_cancelled(
+        cls,
+        report: ResearchReport,
+        *,
+        warning: str | None = None,
+    ) -> None:
+        report.status = JobStatus.CANCELLED.value
+        report.completed_at = timezone.now()
+        report.last_progress_at = report.completed_at
+        update_fields = ["status", "completed_at", "last_progress_at", "modified"]
+        if warning:
+            # Append to the warnings JSON sidecar so the UI can surface
+            # *why* the report stopped (e.g. soft-time-limit) without
+            # losing partial findings to a misleading FAILED label.
+            report.warnings = list(report.warnings or []) + [warning]
+            update_fields.append("warnings")
+        report.save(update_fields=update_fields)
+
+    # ------------------------------------------------------------------
+    # Scratchpad writes (called from agent-bound tool closures)
+    # ------------------------------------------------------------------
+    @classmethod
+    def append_finding(cls, report: ResearchReport, finding: dict) -> None:
+        """Append a structured finding and bump ``last_progress_at``.
+
+        Locks the row for the read-modify-write so a concurrent writer cannot
+        stomp the append (see ``append_tool_call`` for why the lock, not just
+        a refresh, is required), and so a concurrent ``cancel_requested`` flip
+        is observed rather than overwritten.
+        """
+        with transaction.atomic():
+            locked = ResearchReport.objects.select_for_update().get(pk=report.pk)
+            findings = list(locked.findings or [])
+            findings.append(finding)
+            locked.findings = findings
+            locked.step_count = (locked.step_count or 0) + 1
+            locked.last_progress_at = timezone.now()
+            locked.save(
+                update_fields=[
+                    "findings",
+                    "step_count",
+                    "last_progress_at",
+                    "modified",
+                ]
+            )
+        # Mirror the committed state onto the caller's instance — callers read
+        # ``cancel_requested`` off it right after this returns.
+        report.findings = findings
+        report.step_count = locked.step_count
+        report.last_progress_at = locked.last_progress_at
+        report.cancel_requested = locked.cancel_requested
+
+    @classmethod
+    def append_tool_call(cls, report: ResearchReport, entry: dict) -> int:
+        """Append a tool-call audit entry. Cheap; does not bump progress.
+
+        Returns the new length of the log. The audit log is the only running
+        count of how much of the run's step budget has been spent, so the
+        caller that writes it is also the caller that can warn about it — see
+        ``build_step_budget_notice``.
+
+        WHY ``select_for_update`` and not a bare ``refresh_from_db``: every
+        tool call now routes through here via ``_audited`` (research_tasks),
+        making this the hottest read-modify-write on the row. Within one
+        worker the ``sync_to_async(thread_sensitive=True)`` call sites already
+        serialise, but two *processes* can hold the same report — that is
+        exactly what ``reap_stalled_research`` does when it re-enqueues a
+        RUNNING report whose progress clock went cold while the original
+        worker is still alive. Unlocked, the later ``save()`` clobbers the
+        earlier append, silently dropping an audit entry and undercounting the
+        ``calls_made`` that feeds the step-budget notice.
+        """
+        with transaction.atomic():
+            locked = ResearchReport.objects.select_for_update().get(pk=report.pk)
+            log = list(locked.tool_call_log or [])
+            log.append(entry)
+            locked.tool_call_log = log
+            locked.save(update_fields=["tool_call_log", "modified"])
+        report.tool_call_log = log
+        return len(log)
+
+    # ------------------------------------------------------------------
+    # Durable context management — plan + memory (called from tool closures)
+    # ------------------------------------------------------------------
+    # WHY a report-scoped store and not the existing Note / corpus-memory
+    # mechanisms (DRY review, 2026-06): OpenContracts already has two durable
+    # text stores — the ``Note`` model (annotations.models) with its
+    # token-budgeted ``get_partial_note_content`` retrieval, and the
+    # auto-curated ``Corpus.memory_document`` (agents.memory). Both are *shared
+    # corpus state*: writing to either is visible to every user with corpus
+    # READ and persists beyond the run. The deep-research agent is, by design,
+    # strictly read-only over corpus state (see ``DEEP_RESEARCH_READ_ONLY_TOOLS``
+    # — every write tool is excluded, and the system prompt forbids mutation).
+    # Routing its half-formed working notes into Notes/corpus-memory would
+    # leak an in-progress agent's scratchpad into shared, user-visible state
+    # before the report is even finalized. So the agent's private working
+    # memory lives here, on the report (creator-only visibility), and is the
+    # one durable store it is allowed to *write*. It deliberately does NOT
+    # reinvent corpus-level memory; it fills the orthogonal gap of private,
+    # run-scoped memory that survives compaction + restart.
+    @classmethod
+    def update_plan(cls, report: ResearchReport, plan: str) -> str:
+        """Replace the living plan, clamped to ``MAX_RESEARCH_PLAN_CHARS``.
+
+        Returns the stored plan (post-clamp) so the caller can echo back what
+        was actually persisted. Bumps ``last_progress_at`` — writing a plan is
+        real forward progress and should reset the stalled-job clock.
+
+        Refreshes the row first (mirroring ``write_memory``) so a concurrent
+        ``cancel_requested`` flip is not stomped. Last-writer-wins semantics
+        are intentional and safe: only one worker owns a report at a time, and
+        the reaper's ``DEEP_RESEARCH_STUCK_THRESHOLD_SECONDS`` guard makes a
+        two-worker plan race vanishingly unlikely — not worth a
+        ``select_for_update`` on the hot write path.
+        """
+        report.refresh_from_db(fields=["cancel_requested"])
+        clamped = _clamp_text(plan or "", MAX_RESEARCH_PLAN_CHARS)
+        now = timezone.now()
+        report.plan = clamped
+        report.last_progress_at = now
+        report.save(update_fields=["plan", "last_progress_at", "modified"])
+        return clamped
+
+    @classmethod
+    def write_memory(
+        cls,
+        report: ResearchReport,
+        key: str,
+        content: str,
+        *,
+        mode: str = "replace",
+    ) -> dict:
+        """Create/overwrite/append a memory entry under ``key``.
+
+        ``mode`` is ``"replace"`` (default) or ``"append"`` (concatenate with a
+        newline onto any existing value). Enforces, in order: key length, value
+        length, key-count, and total-store-size caps. A cap violation raises
+        :class:`ResearchMemoryLimitExceeded`; malformed input (empty key,
+        unknown mode) raises the :class:`ResearchMemoryError` base. The closure
+        catches the base and surfaces the message to the model. Returns
+        ``{key, bytes, keys}`` summarising the store.
+
+        Refreshes the row first so a concurrent ``cancel_requested`` flip (or a
+        memory write from a redelivered task) is not stomped. Last-writer-wins
+        semantics are intentional here — only one worker owns a report at a
+        time in the normal case, and the reaper's stuck-threshold guard makes a
+        genuine two-worker race vanishingly unlikely — so we deliberately do
+        NOT take a ``select_for_update`` on this hot write path.
+        """
+        key = (key or "").strip()
+        if not key:
+            raise ResearchMemoryError("Memory key must be non-empty.")
+        if len(key) > MAX_RESEARCH_MEMORY_KEY_CHARS:
+            raise ResearchMemoryLimitExceeded(
+                f"Memory key too long ({len(key)} chars); max is "
+                f"{MAX_RESEARCH_MEMORY_KEY_CHARS}. Use a short slug like "
+                "'doc-1421-summary'."
+            )
+        if mode not in ("replace", "append"):
+            raise ResearchMemoryError(
+                f"Unknown memory mode {mode!r}; use 'replace' or 'append'."
+            )
+
+        report.refresh_from_db(fields=["memory", "cancel_requested"])
+        store: dict[str, Any] = dict(report.memory or {})
+
+        existing = store.get(key)
+        prior_content = ""
+        if isinstance(existing, dict):
+            prior_content = str(existing.get("content", ""))
+        if mode == "append" and prior_content:
+            new_content = f"{prior_content}\n{content or ''}"
+        else:
+            new_content = content or ""
+
+        if len(new_content) > MAX_RESEARCH_MEMORY_VALUE_CHARS:
+            raise ResearchMemoryLimitExceeded(
+                f"Memory value for '{key}' is {len(new_content)} chars; max per "
+                f"entry is {MAX_RESEARCH_MEMORY_VALUE_CHARS}. Split it across "
+                "several keys or summarise."
+            )
+
+        # Key-count cap only bites when introducing a NEW key.
+        if key not in store and len(store) >= MAX_RESEARCH_MEMORY_KEYS:
+            raise ResearchMemoryLimitExceeded(
+                f"Memory store already holds {len(store)} keys (max "
+                f"{MAX_RESEARCH_MEMORY_KEYS}). Delete or consolidate keys with "
+                "delete_memory before adding more."
+            )
+
+        # Total-store cap, computed against the post-write state.
+        projected_total = sum(
+            len(str(v.get("content", "")))
+            for k, v in store.items()
+            if k != key and isinstance(v, dict)
+        ) + len(new_content)
+        if projected_total > MAX_RESEARCH_MEMORY_TOTAL_CHARS:
+            raise ResearchMemoryLimitExceeded(
+                f"Writing '{key}' would push the memory store to "
+                f"{projected_total} chars (max {MAX_RESEARCH_MEMORY_TOTAL_CHARS}). "
+                "Prune older keys with delete_memory first."
+            )
+
+        # One timestamp for both the entry's ``updated_at`` and the row's
+        # ``last_progress_at`` so they agree exactly (two ``timezone.now()``
+        # calls would drift microseconds apart).
+        now = timezone.now()
+        store[key] = {
+            "content": new_content,
+            "updated_at": now.isoformat(),
+        }
+        report.memory = store
+        report.last_progress_at = now
+        report.save(update_fields=["memory", "last_progress_at", "modified"])
+        return {"key": key, "bytes": len(new_content), "keys": len(store)}
+
+    @classmethod
+    def delete_memory(cls, report: ResearchReport, key: str) -> bool:
+        """Drop a memory entry. Returns True if a key was removed.
+
+        Bumps ``last_progress_at`` on a successful delete: pruning keys to free
+        room under the store caps is real forward progress, so an agent that is
+        only deleting should not look stalled to the reaper.
+        """
+        report.refresh_from_db(fields=["memory"])
+        store = dict(report.memory or {})
+        if key not in store:
+            return False
+        del store[key]
+        report.memory = store
+        report.last_progress_at = timezone.now()
+        report.save(update_fields=["memory", "last_progress_at", "modified"])
+        return True
+
+    @classmethod
+    def read_memory(cls, report: ResearchReport, key: str) -> str | None:
+        """Return the content stored under ``key`` (fresh read), or None."""
+        report.refresh_from_db(fields=["memory"])
+        entry = (report.memory or {}).get(key)
+        if isinstance(entry, dict):
+            return str(entry.get("content", ""))
+        return None
+
+    @classmethod
+    def memory_index(cls, report: ResearchReport) -> list[dict]:
+        """Return ``[{key, bytes, preview}]`` for every memory entry.
+
+        Sorted by key for stable rendering in the prompt index. Does not
+        refresh — callers that need freshness refresh first (the ``list_memory``
+        tool closure satisfies this by calling ``refresh_from_db(["memory"])``
+        immediately before this method).
+        """
+        out: list[dict] = []
+        for key in sorted((report.memory or {}).keys()):
+            entry = report.memory[key]
+            content = str(entry.get("content", "")) if isinstance(entry, dict) else ""
+            preview = content[:RESEARCH_MEMORY_PREVIEW_CHARS].replace("\n", " ")
+            out.append({"key": key, "bytes": len(content), "preview": preview})
+        return out
+
+    @classmethod
+    def search_memory(
+        cls, report: ResearchReport, query: str, *, max_hits: int | None = None
+    ) -> list[dict]:
+        """Grep across memory entries AND recorded findings.
+
+        Case-insensitive substring match, line-oriented (like ``grep``).
+        Returns ``[{source, key, line}]`` where ``source`` is ``"memory"`` or
+        ``"finding"``. Capped at ``max_hits`` (default
+        ``RESEARCH_MEMORY_SEARCH_MAX_HITS``) so a broad query cannot dump the
+        whole store back into context.
+        """
+        report.refresh_from_db(fields=["memory", "findings"])
+        needle = (query or "").strip().lower()
+        limit = max_hits or RESEARCH_MEMORY_SEARCH_MAX_HITS
+        hits: list[dict] = []
+        if not needle:
+            return hits
+
+        for key in sorted((report.memory or {}).keys()):
+            entry = report.memory[key]
+            content = str(entry.get("content", "")) if isinstance(entry, dict) else ""
+            for line in content.splitlines():
+                if needle in line.lower():
+                    hits.append({"source": "memory", "key": key, "line": line.strip()})
+                    if len(hits) >= limit:
+                        return hits
+
+        for idx, finding in enumerate(report.findings or []):
+            claim = str((finding or {}).get("claim", ""))
+            if needle in claim.lower():
+                section = str((finding or {}).get("section", "Findings"))
+                hits.append(
+                    {"source": "finding", "key": section, "line": claim.strip()}
+                )
+                if len(hits) >= limit:
+                    return hits
+        return hits
+
+    # ------------------------------------------------------------------
+    # Recovery — rebuild the durable context surface for a (re)started run
+    # ------------------------------------------------------------------
+    @classmethod
+    def build_recovery_digest(cls, report: ResearchReport) -> dict:
+        """Assemble the plan / findings-digest / memory-index strings used to
+        prime the system prompt at the start of a run.
+
+        Always cheap and bounded: the findings digest is the tail
+        (``RESEARCH_RECOVERY_FINDINGS_DIGEST`` most recent) rendered compactly,
+        and the memory index is keys + sizes + short previews — never full
+        contents. The agent pulls full memory on demand via ``read_memory`` /
+        ``search_memory``.
+
+        Reads from the in-memory ``report`` object and does NOT refresh from the
+        DB. This is intentional for the only caller (task startup, where the row
+        was just loaded). If a future mid-run caller needs freshness, it must
+        call ``report.refresh_from_db()`` first — unlike ``search_memory``,
+        which refreshes itself because it runs from a tool closure.
+        """
+        plan = (report.plan or "").strip()
+
+        findings = list(report.findings or [])
+        recent = findings[-RESEARCH_RECOVERY_FINDINGS_DIGEST:]
+        digest_lines: list[str] = []
+        if len(findings) > len(recent):
+            digest_lines.append(
+                f"_(showing the {len(recent)} most recent of "
+                f"{len(findings)} findings — search_memory for the rest)_"
+            )
+        for finding in recent:
+            section = str((finding or {}).get("section", "Findings"))
+            claim = str((finding or {}).get("claim", "")).strip()
+            cites = (finding or {}).get("citations") or []
+            cite_str = (
+                " [cites: " + ",".join(str(c) for c in cites) + "]" if cites else ""
+            )
+            digest_lines.append(f"- ({section}) {claim}{cite_str}")
+        findings_digest = "\n".join(digest_lines)
+
+        index = cls.memory_index(report)
+        memory_lines = [
+            f"- `{item['key']}` ({item['bytes']} chars): {item['preview']}"
+            for item in index
+        ]
+        memory_index_str = "\n".join(memory_lines)
+
+        return {
+            "plan": plan,
+            "findings_digest": findings_digest,
+            "memory_index": memory_index_str,
+            "is_resume": bool(plan or findings or index),
+        }
+
+    # ------------------------------------------------------------------
+    # Resume — re-enqueue a stalled RUNNING report
+    # ------------------------------------------------------------------
+    @classmethod
+    def list_stalled(cls, *, older_than_seconds: int | None = None) -> list[int]:
+        """Return PKs of RUNNING reports whose ``last_progress_at`` is older
+        than the stuck threshold (a crashed worker leaves the row RUNNING with
+        no further progress). Used by the periodic reaper to resume them.
+        """
+        threshold = older_than_seconds
+        if threshold is None:
+            threshold = getattr(
+                settings,
+                "DEEP_RESEARCH_STUCK_THRESHOLD_SECONDS",
+                getattr(settings, "DEEP_RESEARCH_SOFT_TIME_LIMIT", 1800) * 2,
+            )
+        cutoff = timezone.now() - timedelta(seconds=threshold)
+        qs = ResearchReport.objects.filter(
+            status=JobStatus.RUNNING.value,
+            last_progress_at__lt=cutoff,
+        ).values_list("pk", flat=True)
+        return list(qs)
+
+    @classmethod
+    def resume(cls, report: ResearchReport) -> bool:
+        """Re-enqueue ``run_deep_research`` for a stalled RUNNING report.
+
+        No-op (returns False) for a terminal report. Does NOT mutate status —
+        the task's ``mark_started(resuming=True)`` handles that — so a double
+        resume is harmless: the second pickup sees the durable state and
+        continues. Returns True when a task was enqueued.
+        """
+        if report.is_terminal:
+            return False
+        from opencontractserver.tasks.research_tasks import run_deep_research
+
+        run_deep_research.delay(report.pk)
+        cls.log_action("Resumed", report, report.creator)
+        return True
+
+    # ------------------------------------------------------------------
+    # Finalize (terminal write from inside the loop)
+    # ------------------------------------------------------------------
+    @classmethod
+    def finalize_once(
+        cls,
+        report: ResearchReport,
+        *,
+        executive_summary: str,
+        markdown_body: str,
+        retrieved_annotation_ids: list[int],
+        warnings: list[str] | None = None,
+    ) -> bool:
+        """Finalize exactly once, returning False if the run already ended.
+
+        ``finalize`` is deliberately NOT idempotent — a second call re-runs
+        composition, so the stored report becomes the later body while both
+        passes' warnings accumulate (pinned by
+        ``test_finalizing_twice_appends_its_warnings_twice``). The caller
+        therefore has to refuse the second call, and a plain
+        ``refresh_from_db`` + status check is check-then-act: pydantic-ai can
+        dispatch parallel tool calls, so two ``finalize_report`` invocations
+        can both read RUNNING before either commits COMPLETED and both
+        compose.
+
+        Holding the row lock across the whole composition closes that window —
+        the loser blocks, then re-reads a terminal status and is turned away.
+        Same treatment ``append_finding`` / ``append_tool_call`` already get,
+        and for the same reason (one report, concurrent writers). Locking for
+        the duration is acceptable precisely because this is the run's terminal
+        step: serialising it is the point, not a cost.
+
+        The guard is ``is_terminal``, not ``status == COMPLETED``. CANCELLED
+        and FAILED are also "the run already ended", and only COMPLETED was
+        being refused: a second worker (``reap_stalled_research`` resumes a
+        stalled RUNNING report, so two can be live at once) could finalize on
+        top of a row the first worker had just marked CANCELLED by soft time
+        limit or FAILED with a traceback. The result is a report that reads
+        COMPLETED while still carrying the other worker's ``error_message``,
+        after the user has already been notified the run was cancelled. No
+        path resets a report out of a terminal state — ``resume`` refuses one
+        outright — so widening this cannot strand a run that ought to finish.
+        """
+        with transaction.atomic():
+            locked = ResearchReport.objects.select_for_update().get(pk=report.pk)
+            if locked.is_terminal:
+                return False
+            cls.finalize(
+                report,
+                executive_summary=executive_summary,
+                markdown_body=markdown_body,
+                retrieved_annotation_ids=retrieved_annotation_ids,
+                warnings=warnings,
+            )
+        return True
+
+    @classmethod
+    def finalize(
+        cls,
+        report: ResearchReport,
+        *,
+        executive_summary: str,
+        markdown_body: str,
+        retrieved_annotation_ids: list[int],
+        warnings: list[str] | None = None,
+    ) -> None:
+        """Render the final report and mark it COMPLETED.
+
+        Composes ONE document — ``## Executive Summary`` + ``executive_summary``
+        + ``markdown_body`` — and runs the citation post-processors over it
+        exactly once, then appends the rendered ``## Sources`` footnote section.
+        Composing first is what keeps the pipeline honest: a ``<cite>`` tag the
+        agent put in its summary is rendered rather than leaking raw into the
+        stored content (issue #2200), and every guard below sees the whole
+        document, not just the body.
+
+        The pipeline, in order:
+
+        - ``_sanitize_agent_markdown`` drops agent-authored ``## Executive
+          Summary`` / ``## Sources`` headings and the hyperlinks the (web-less)
+          agent invented — every URL it emits is fabricated, and the ``<cite>``
+          footnotes are the only sanctioned attribution channel.
+          ``_summary_duplicates_body`` then drops a summary that merely restates
+          the body; together these stop the report rendering twice (#2200).
+        - ``_verify_cite_spans`` collapses self-echoing cite spans, demotes
+          quotes that are not verbatim in their cited annotation (issue #2189),
+          and strips citations whose anchor does not support the sentence
+          (issue #2201). Each rewrite is corrective *and* counted into a warning.
+        - ``_render_citations`` converts the surviving ``<cite ids="1,2">claim
+          </cite>`` / ``<cite ids="1,2"/>`` placeholders into ``[^n]`` markers
+          and builds the structured ``citations`` table; a concise
+          weak-citation warning is appended when any footnote anchors a
+          section-header label (``_is_header_anchor``, issue #2180) —
+          observational only, it never rewrites the prose.
+
+        ``retrieved_annotation_ids`` is the union of annotation IDs the
+        retrieval tools surfaced during this run (the
+        :attr:`PydanticAIDependencies.retrieved_annotation_ids` accumulator).
+        It is the sole gate on what may be cited: an id qualifies by coming
+        from a finding OR by appearing in the composed document, but either way
+        only if retrieval surfaced it. That is the closed citation graph, and it
+        is also what bounds the ``source_annotations`` M2M.
+        """
+        from opencontractserver.annotations.models import Annotation
+
+        # Collect every annotation_id cited by any finding.
+        cited_ids: set[int] = set()
+        for finding in report.findings or []:
+            for cid in finding.get("citations", []) or []:
+                try:
+                    cited_ids.add(int(cid))
+                except (TypeError, ValueError):
+                    continue
+
+        # Normalise the two agent-authored fragments, then compose ONE document
+        # so every post-processor below runs over the whole report exactly once
+        # (issue #2200). Both the normal and the salvage body flow through here.
+        summary, summary_sections = _sanitize_agent_markdown(executive_summary or "")
+        body, body_sections = _sanitize_agent_markdown(markdown_body or "")
+        sections_stripped = summary_sections + body_sections
+        summary_dropped = bool(summary) and _summary_duplicates_body(summary, body)
+        if summary_dropped:
+            summary = ""
+
+        document = "\n\n".join(
+            part
+            for part in (
+                "## Executive Summary\n\n" + summary if summary else "",
+                body,
+            )
+            if part
+        )
+
+        # Plus every id the composed document itself cites. ``record_finding``
+        # is the scratchpad, not the only road to a citation:
+        # ``find_citable_passages`` hands the agent a ready-to-paste handle and
+        # the prompt tells it that id IS the cite handle, so an id legitimately
+        # reaches the body without passing through a finding. Requiring one
+        # dropped exactly that citation — silently for a short claim, and for a
+        # longer one under a "not supported by the passage it cited" warning
+        # naming the wrong cause, since an id outside this set hydrates no
+        # anchor text and so cannot support anything.
+        cited_ids |= _cited_ids_in(document)
+
+        # The closed citation graph is enforced HERE, and only here: whichever
+        # road an id took, it may be cited only if retrieval actually surfaced
+        # it this run. Every retrieval tool is permission-filtered, so this is
+        # also what keeps a citation inside what the run's creator may read.
+        cited_ids &= set(retrieved_annotation_ids)
+
+        # The evidence gate, second half. ``record_finding`` refuses a material
+        # card with no citation at the door; this catches the card whose
+        # citations did not SURVIVE — an id the agent passed that retrieval
+        # never actually surfaced is filtered out of ``cited_ids`` above, which
+        # can leave a material card unsupported by the time we render. Such a
+        # card is withheld from the report rather than printed as though it
+        # were sourced, and the count is surfaced as a warning so the omission
+        # is visible rather than silent.
+        withheld_findings = False
+        blocked = [
+            finding
+            for finding in (report.findings or [])
+            if (finding.get("card") or {}).get("material")
+            and not (set(finding.get("citations") or []) & cited_ids)
+        ]
+        if blocked:
+            report.findings = [
+                finding for finding in (report.findings or []) if finding not in blocked
+            ]
+            withheld_findings = True
+            update_warnings = list(warnings or [])
+            update_warnings.append(
+                f"{len(blocked)} material obligation card(s) were withheld from "
+                "the report: their supporting annotations were not surfaced by "
+                "retrieval in this run, so nothing entails them."
+            )
+            warnings = update_warnings
+
+        verified = _verify_cite_spans(document, cited_ids)
+        rendered, citations = _render_citations(verified.markdown, cited_ids)
+
+        # A CAML component marker, placed AFTER the citation post-processors
+        # have run so none of them rewrite it, and above the prose so the
+        # article opens with the structured takeaway. The embed reads the
+        # report's own ``findings``, because marker props are strings only and
+        # a card does not serialise into one.
+        full_content_parts: list[str] = []
+        if any(f.get("card") for f in report.findings or []):
+            from graphql_relay import to_global_id
+
+            full_content_parts.append(
+                "[component:research-findings reportId="
+                f"{to_global_id('ResearchReportType', report.pk)}]"
+            )
+        full_content_parts.append(rendered)
+        if citations:
+            sources_section = ["## Sources", ""]
+            for entry in citations:
+                sources_section.append(f"[^{entry['footnote']}]: {entry['display']}")
+            full_content_parts.append("\n".join(sources_section))
+
+        report.content = "\n\n".join(
+            part for part in full_content_parts if part.strip()
+        )
+        report.citations = citations
+        report.status = JobStatus.COMPLETED.value
+        report.completed_at = timezone.now()
+        report.last_progress_at = report.completed_at
+        update_fields = [
+            "content",
+            "citations",
+            "status",
+            "completed_at",
+            "last_progress_at",
+            "modified",
+        ]
+        if withheld_findings:
+            # The withheld cards are removed from the stored scratchpad too, so
+            # the report and its findings cannot disagree about what was
+            # supported.
+            update_fields.append("findings")
+        # Surface a weak-citation warning when any footnote resolves to a
+        # section header / structural anchor rather than a supporting passage
+        # (issue #2180). Observational only — it never rewrites the prose, it
+        # just flags footnotes a reviewer (or future automated checker) should
+        # double-check.
+        extra_warnings: list[str] = list(warnings or [])
+
+        # A COMPLETED report must never be silently blank. The agent can hand
+        # finalize vacuous content — a body that was nothing but scaffolding or
+        # a fabricated link, so ``_sanitize_agent_markdown`` reduced it to "" —
+        # which the salvage path does not cover (it only catches "the agent
+        # never called finalize"). Say so rather than storing an empty report
+        # that looks like a successful run.
+        if not (report.content or "").strip():
+            extra_warnings.append(
+                "The agent finalized with no report content; nothing survived "
+                "composition. Re-run the research task."
+            )
+
+        # A card that gives the same date for approval and effectiveness has
+        # almost always conflated them: a regulator approving an instrument is
+        # a different event from the instrument taking effect, and the gap
+        # between them is exactly the window a reader needs when asking which
+        # regime governed a given day. The fields are separate so this is
+        # visible; flagged rather than rewritten, because the two genuinely
+        # coincide often enough that refusing the card would be wrong.
+        # An obligation whose obligor is not named by any passage it cites. The
+        # card is kept — the requirement is real and losing it is worse — but a
+        # reader has to be told which attributions are inferred, because that
+        # is the one defect two independent reviewers found in the same report.
+        ungrounded = sum(
+            1
+            for finding in report.findings or []
+            if (finding.get("card") or {}).get("obligor_grounded") is False
+        )
+        if ungrounded:
+            extra_warnings.append(
+                _pluralize(
+                    ungrounded,
+                    "obligation card names a responsible party that none of its "
+                    "cited passages mention; that attribution is",
+                    "obligation cards name a responsible party that none of "
+                    "their cited passages mention; those attributions are",
+                )
+                + " inferred rather than sourced — verify who actually bears "
+                "the duty before relying on it."
+            )
+
+        conflated = 0
+        for finding in report.findings or []:
+            card = finding.get("card") or {}
+            approval = (card.get("approval_date") or "").strip()
+            if approval and approval == (card.get("effective_date") or "").strip():
+                conflated += 1
+        if conflated:
+            extra_warnings.append(
+                _pluralize(
+                    conflated,
+                    "finding card gives the same date for approval and "
+                    "effectiveness; verify it",
+                    "finding cards give the same date for approval and "
+                    "effectiveness; verify they",
+                )
+                + " against the source — approval is not effectiveness."
+            )
+
+        header_footnotes = [
+            c["footnote"] for c in citations if c.get("anchor_is_header")
+        ]
+        if header_footnotes:
+            markers = ", ".join(f"[^{n}]" for n in header_footnotes)
+            extra_warnings.append(
+                _pluralize(
+                    len(header_footnotes),
+                    "citation anchors a section header rather than a supporting "
+                    f"passage ({markers}); verify it points",
+                    "citations anchor section headers rather than supporting "
+                    f"passages ({markers}); verify they point",
+                )
+                + " at the operative language."
+            )
+
+        # Surface warnings for the two corrective guards. Both already rewrote
+        # the stored content; the warning tells the reader what changed and why.
+        if verified.quotes_demoted:
+            extra_warnings.append(
+                _pluralize(
+                    verified.quotes_demoted,
+                    "quoted passage did not match its cited source text and was",
+                    "quoted passages did not match their cited source text and were",
+                )
+                + " converted to paraphrase (quotation marks removed); verify "
+                "the wording against the source."
+            )
+        if verified.cites_dropped:
+            extra_warnings.append(
+                _pluralize(
+                    verified.cites_dropped,
+                    "sentence was not supported by the passage it cited, so its "
+                    "citation was",
+                    "sentences were not supported by the passages they cited, so "
+                    "their citations were",
+                )
+                + " removed; the prose is retained as uncited analysis."
+            )
+        if verified.echoes_trimmed:
+            extra_warnings.append(
+                _pluralize(
+                    verified.echoes_trimmed,
+                    "citation restated the sentence before it and was",
+                    "citations restated the sentences before them and were",
+                )
+                + " collapsed to a footnote; a small amount of text inside the "
+                "tag went with the restatement."
+            )
+        if summary_dropped:
+            extra_warnings.append(
+                "The executive summary restated the body rather than abstracting "
+                "it, so it was dropped and the report opens with the body. A "
+                "terse summary built mostly around one quoted body sentence can "
+                "read the same way to this check — see the report body for the "
+                "material either way."
+            )
+        if sections_stripped:
+            extra_warnings.append(
+                _pluralize(
+                    sections_stripped,
+                    "agent-authored Sources/References section was",
+                    "agent-authored Sources/References sections were",
+                )
+                + " removed; the system renders the footnote table itself. "
+                "Check nothing substantive was written under that heading."
+            )
+
+        if extra_warnings:
+            # Append rather than replace so prior warnings from
+            # ``append_finding`` / ``append_tool_call`` survive.
+            report.warnings = list(report.warnings or []) + extra_warnings
+            update_fields.append("warnings")
+
+        # Single atomic block so the terminal content write and the M2M
+        # provenance links commit together. Without this, a worker that
+        # dies (or a soft-time-limit) between ``save()`` and the M2M
+        # ``set()`` calls would leave a COMPLETED report whose content
+        # cites footnotes that have no ``source_annotations`` /
+        # ``source_documents`` rows behind them — content with empty
+        # provenance. The block wraps only the writes; the content/citation
+        # rendering above is pure computation and stays outside.
+        with transaction.atomic():
+            report.save(update_fields=update_fields)
+
+            # Populate M2M provenance links. Restrict to annotation IDs that
+            # exist (defensive: agent could in principle cite a deleted row).
+            if citations:
+                annotation_ids = [c["annotation_id"] for c in citations]
+                existing_annotations = Annotation.objects.filter(
+                    pk__in=annotation_ids
+                ).select_related("document")
+                report.source_annotations.set(existing_annotations)
+                doc_ids = {
+                    ann.document_id for ann in existing_annotations if ann.document_id
+                }
+                if doc_ids:
+                    from opencontractserver.documents.models import Document
+
+                    report.source_documents.set(Document.objects.filter(pk__in=doc_ids))
+
+        # File the finished report in the creator's workspace. Deliberately
+        # OUTSIDE the atomic block above: the report is already COMPLETED and
+        # its provenance committed, and a research run costs minutes of model
+        # time. A failed file write must not roll that back or turn a
+        # successful run into a failed one.
+        cls._save_to_workspace(report)
+
+    # ------------------------------------------------------------------
+    # Workspace copy
+    # ------------------------------------------------------------------
+    @classmethod
+    def _workspace_markdown(cls, report: ResearchReport) -> str:
+        """Compose the file body: provenance header, then the report.
+
+        The header exists so the file explains itself when someone opens it
+        months later outside the app, where there is no surrounding UI to say
+        which corpus it came from or when it was generated.
+        """
+        generated = report.completed_at or timezone.now()
+        header = [
+            f"# {report.title}",
+            "",
+            f"- **Source corpus:** {report.corpus.title}",
+            f"- **Generated:** {generated.date().isoformat()}",
+            f"- **Report:** [/research/{report.slug}](/research/{report.slug})",
+            "",
+            "---",
+        ]
+        return "\n".join(header) + "\n\n" + (report.content or "")
+
+    @classmethod
+    def _save_to_workspace(cls, report: ResearchReport) -> None:
+        """Save the completed report to its creator's personal workspace.
+
+        Never raises. Every failure mode here — no creator, a storage error, a
+        workspace corpus that cannot be provisioned — is strictly less
+        important than the report that already succeeded, so failures are
+        logged and leave ``workspace_document`` null.
+        """
+        from opencontractserver.corpuses.services import WorkspaceService
+
+        creator = report.creator
+        if creator is None:
+            logger.warning(
+                "Research report %s has no creator; skipping workspace save.",
+                report.pk,
+            )
+            return
+
+        # The link write is INSIDE the try as well. Guarding only the
+        # ``save_markdown`` call would leave a hole in the guarantee this method
+        # exists to provide: a stale ``report`` instance or a concurrently
+        # deleted row makes ``report.save()`` raise, and that exception would
+        # propagate out of ``finalize`` into the Celery task — reporting failure
+        # for a run whose report is already committed COMPLETED.
+        try:
+            document = WorkspaceService.save_markdown(
+                user=creator,
+                title=report.title,
+                content=cls._workspace_markdown(report),
+                folder_name=RESEARCH_WORKSPACE_FOLDER,
+                # Keyed on the slug, not the title: the path is the idempotency
+                # key, so a title edit between saves would otherwise strand the
+                # old file and start a new one instead of versioning.
+                filename_stem=report.slug or f"research-report-{report.pk}",
+            )
+            report.workspace_document = document
+            report.save(update_fields=["workspace_document", "modified"])
+        except Exception:
+            logger.exception(
+                "Failed to save research report %s to its creator's workspace; "
+                "the report itself is unaffected.",
+                report.pk,
+            )
+
+    # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
+    @classmethod
+    def request_cancel(cls, user: Any, report: ResearchReport) -> None:
+        """Flip ``cancel_requested``. The running loop polls and exits."""
+        if report.creator_id != getattr(user, "id", None) and not getattr(
+            user, "is_superuser", False
+        ):
+            raise PermissionError(
+                "Only the creator (or a superuser) can cancel a research report."
+            )
+        if report.is_terminal:
+            return
+        report.cancel_requested = True
+        report.save(update_fields=["cancel_requested", "modified"])
+        cls.log_action("CancelRequested", report, user)
+
+    @classmethod
+    def cancel_if_requested(cls, report: ResearchReport) -> bool:
+        """Return True (and raise) when a cancel has been requested.
+
+        Polled by the agent's scratchpad-tool closures between calls.
+        """
+        report.refresh_from_db(fields=["cancel_requested"])
+        if report.cancel_requested:
+            raise ResearchCancelled(f"Research report {report.pk} cancel requested")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _pluralize(count: int, singular: str, plural: str) -> str:
+    """``"1 citation anchors…"`` / ``"3 citations anchor…"``.
+
+    The finalize warnings are read by humans in the report UI, so the grammar
+    has to agree; this keeps the three warning builders from each re-deriving
+    it.
+    """
+    return f"{count} {singular if count == 1 else plural}"
+
+
+def _clamp_text(text: str, limit: int) -> str:
+    """Truncate ``text`` to ``limit`` chars, keeping the head.
+
+    The head of a plan is the task restatement + next steps — the part the
+    agent most needs on recovery — so we drop the tail and append a marker
+    rather than truncating from the front.
+    """
+    if len(text) <= limit:
+        return text
+    marker = "\n\n…[truncated]"
+    keep = max(0, limit - len(marker))
+    return text[:keep].rstrip() + marker
+
+
+def _derive_title_from_prompt(prompt: str, limit: int = 80) -> str:
+    """Fallback title — first non-trivial line of the prompt, truncated."""
+    first_line = ""
+    for line in (prompt or "").splitlines():
+        candidate = line.strip().lstrip("#").strip()
+        if candidate:
+            first_line = candidate
+            break
+    if not first_line:
+        return "Untitled Research Report"
+    if len(first_line) <= limit:
+        return first_line
+    return first_line[: limit - 1].rstrip() + "…"
+
+
+# Inline markdown link (optionally an image: ``![alt](src)``), capturing the
+# label/alt text and the target. The target group stops at the first space,
+# ``)`` or ``>`` so a trailing ``"title"`` and angle-bracket wrappers
+# (``<https://…>``) are tolerated. Footnote markers/definitions (``[^1]`` /
+# ``[^1]: …``) have no ``(target)`` and never match.
+# Inline links only. The target group ``([^)\s>]+)`` stops at the first ``)``,
+# so a parenthesised URL like ``Foo_(bar)`` is captured as ``Foo_(bar`` and the
+# trailing ``)`` leaks through — academic here since the agent fabricates flat
+# ``example.com`` URLs without parens.
+_MARKDOWN_LINK_RE = re.compile(
+    r"!?\[([^\]]*)\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)"
+)
+
+# A link target that resolves *outside* the SPA: an explicit ``scheme://``,
+# a protocol-relative ``//host``, a ``mailto:``/``tel:``, or a bare domain
+# (``example.com/…``). These are exactly the targets ``SafeMarkdown`` would
+# turn into a live anchor. In-app relative paths (``/d/…``) and bare
+# fragments (``#section``) are deliberately NOT matched.
+_EXTERNAL_TARGET_RE = re.compile(
+    r"""^(?:
+        [a-z][a-z0-9+.\-]*://       # scheme://  (http, https, ftp, …)
+        | //                        # protocol-relative  //host
+        | mailto: | tel:            # non-web but still externally resolvable
+        | [\w-]+(?:\.[\w-]{2,})+     # bare domain  example.com/… (TLD ≥2 chars,
+                                    # so dotted prose like ``v1.0`` / ``section_a.2``
+                                    # is not mistaken for a link target). Known
+                                    # false positive: a relative ``name.ext``
+                                    # path (``schema.json``, ``openapi.yaml``)
+                                    # also matches — fine today since the agent
+                                    # emits no legitimate relative-path links.
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _strip_fabricated_links(markdown: str) -> str:
+    """Downgrade externally-resolvable markdown links the (web-less) agent
+    invented to their plain label before storage, leaving the sanctioned
+    ``<cite ids="…">`` tag, in-app relative links, and fragment anchors intact.
+
+    Deliberate gap: only *inline* ``[text](url)`` links are matched, not
+    reference-style ``[text][1]`` + ``[1]: url`` (the observed fabrication is the
+    inline ``example.com`` placeholder); pinned by
+    ``test_strip_fabricated_links_leaves_reference_style_links_unchanged``.
+    """
+    if not markdown:
+        return markdown
+
+    def _replace(match: re.Match[str]) -> str:
+        label = match.group(1)
+        target = match.group(2).strip()
+        if _EXTERNAL_TARGET_RE.match(target):
+            # Drop the fabricated URL (and any leading ``!`` image marker),
+            # keep the human-readable label so the prose still reads cleanly.
+            return label
+        return match.group(0)
+
+    return _MARKDOWN_LINK_RE.sub(_replace, markdown)
+
+
+def _sanitize_agent_markdown(markdown: str) -> tuple[str, int]:
+    """Normalise one agent-authored fragment before it joins the document.
+
+    Strips the scaffolding ``finalize`` owns (see ``_strip_scaffold_headings``)
+    and the hyperlinks the web-less agent invents (see
+    ``_strip_fabricated_links``). Applied to the executive summary and the body
+    alike so neither can smuggle either past the other's checks — and so a
+    fragment that was *nothing but* a fabricated link reduces to "" and is
+    dropped rather than leaving an empty section behind.
+
+    Returns ``(cleaned, sections_stripped)``; the count feeds a warning so a
+    whole dropped section is never silent, matching the other guards.
+    """
+    stripped, sections = _strip_scaffold_headings(markdown)
+    return _strip_fabricated_links(stripped).strip(), sections
+
+
+def _fenced_line_indexes(lines: list[str]) -> set[int]:
+    """Indexes of lines sitting inside a CLOSED fenced code block.
+
+    Follows CommonMark on what closes a fence — the same character, on a run at
+    least as long as the opening — so neither a stray ``~~~`` nor a literal
+    ```` ``` ```` line inside a ```` ```` ```` block ends one early.
+
+    Departs from CommonMark on one point, deliberately: an opener with no
+    matching closer is ignored rather than treated as running to end of
+    document. In LLM-authored markdown a lone ``` is far likelier a stray
+    artifact than an intent to code-block everything that follows, and honouring
+    it would suspend heading detection for the rest of the report — which is how
+    scaffolding stops being stripped, or a section skip runs off the end and
+    takes the report's tail with it. Both failures are silent.
+
+    Scanning forward for the closer is quadratic only in the number of
+    unmatched openers, which is bounded by how many fence lines the agent
+    writes; every matched pair advances past its own block.
+    """
+    inside: set[int] = set()
+    index, total = 0, len(lines)
+    while index < total:
+        opener = _CODE_FENCE_RE.match(lines[index])
+        if not opener:
+            index += 1
+            continue
+        marker = opener.group(1)
+        for close in range(index + 1, total):
+            candidate = _CODE_FENCE_RE.match(lines[close])
+            if (
+                candidate
+                and candidate.group(1)[0] == marker[0]
+                and len(candidate.group(1)) >= len(marker)
+            ):
+                inside.update(range(index, close + 1))
+                index = close + 1
+                break
+        else:
+            # Unmatched opener: not a fence. Keep scanning after it, so a later
+            # balanced pair in the same document is still recognised.
+            index += 1
+    return inside
+
+
+def _strip_scaffold_headings(markdown: str) -> tuple[str, int]:
+    """Remove the report scaffolding the SYSTEM owns from agent-authored text.
+
+    ``finalize`` writes the ``## Executive Summary`` header and renders the
+    ``## Sources`` footnote table itself. An agent that writes its own copies
+    produces the doubled document of issue #2200 — a full report, a stub
+    "## Sources — (all claims are cited inline)" line, then the whole report
+    again. A sources-flavoured heading takes its section with it (up to the next
+    heading at the same or a shallower level); the executive-summary heading is
+    dropped alone so the prose beneath it survives as the summary.
+
+    Stripping is nesting-aware: a subsection *inside* the scaffolding section
+    (``## Sources`` -> ``### By Document``) goes with it, rather than ending the
+    skip and leaking orphaned scaffolding into the report — which is the very
+    thing #2200 is about. A heading at the same or a shallower level ends the
+    section, as it does in the markdown itself.
+
+    Returns ``(cleaned, sections_stripped)``. Dropping a whole section is a much
+    bigger blast radius than dropping a heading line, so the count is surfaced
+    as a warning by ``finalize`` — consistent with the quote/claim-support
+    guards, and it doubles as the signal for whether the prompt rule forbidding
+    these headings is actually landing.
+    """
+    if not markdown:
+        return "", 0
+    kept: list[str] = []
+    # Heading level of the scaffolding section currently being skipped, or None.
+    skip_level: int | None = None
+    sections = 0
+    # Fence spans are resolved up front, over the whole document and with no
+    # reference to what is being skipped. Interleaving the two states is what
+    # produced both of this helper's fence bugs: track fences during a skip and
+    # one unbalanced ``` in the scaffolding suspends heading detection for good,
+    # so the section never ends and the report's tail is dropped; stop tracking
+    # them during a skip and a heading-shaped line inside a fenced block ends the
+    # skip early, leaking the rest of the scaffolding. Neither is a trade worth
+    # making, and neither arises once the two are independent.
+    lines = markdown.splitlines()
+    fenced = _fenced_line_indexes(lines)
+    for index, line in enumerate(lines):
+        heading = None if index in fenced else _MD_HEADING_RE.match(line)
+        if heading:
+            level = len(heading.group(1))
+            title = _normalize_label(heading.group(2))
+            # A heading at the same or a shallower level closes the section;
+            # a deeper one is nested inside it and keeps the skip running.
+            if skip_level is not None and level <= skip_level:
+                skip_level = None
+            if skip_level is None:
+                if title in _SCAFFOLD_SECTION_HEADINGS:
+                    skip_level = level
+                    sections += 1
+                    continue
+                if title in _SCAFFOLD_HEADING_LINES:
+                    continue
+        if skip_level is None:
+            kept.append(line)
+    return "\n".join(kept).strip(), sections
+
+
+def _summary_duplicates_body(summary: str, body: str) -> bool:
+    """True when ``summary`` is just a copy of ``body`` (issue #2200).
+
+    The agent was observed passing the entire report as BOTH ``executive_summary``
+    and ``markdown_body``, so the report rendered twice. Compares the summary's
+    opening (``RESEARCH_SUMMARY_DUPLICATE_PROBE_CHARS``) against the body rather
+    than diffing two multi-KB strings: a genuine copy always matches from its
+    first sentence, and a real 2–4 sentence summary — written to abstract, not
+    restate — does not.
+
+    Two known edges, both pinned by tests:
+
+    * Being opening-anchored, this does not catch a summary that pastes the body
+      after a throwaway first sentence. The observed mode is a verbatim copy of
+      the whole thing, and a general dedup would mean the multi-KB diff this
+      deliberately avoids.
+    * A very SHORT summary built mostly around one verbatim body sentence reads
+      as a copy, because coverage is a ratio over the summary: at ~150 chars a
+      single quoted sentence is already most of it. A normal-length summary
+      carrying the same quote stays well clear. The drop is reported by
+      ``finalize`` rather than silent, since losing the whole section is a much
+      bigger blast radius than the tail cases the other guards trim.
+
+    Only the needle is capped; the body is searched whole, so cost is linear in
+    the report — measured at roughly 6ms per KB, i.e. tens of ms for the report
+    sizes an agent actually writes, against a task that just spent minutes in
+    the model. Capping the haystack too would buy little and would blind the
+    check to a summary that copies the body's MIDDLE, which it currently
+    catches. Unlike the echo guard there is no arithmetic short-circuit to be
+    had here: the unbounded side is the haystack, not the ratio's denominator,
+    so a match can sit anywhere in it.
+    """
+    body_norm = _normalize_for_quote_match(body)
+    summary_norm = _normalize_for_quote_match(summary)
+    if not summary_norm or not body_norm:
+        return False
+    probe = summary_norm[:RESEARCH_SUMMARY_DUPLICATE_PROBE_CHARS]
+    return (
+        _contiguous_coverage(probe, body_norm) >= RESEARCH_SUMMARY_DUPLICATE_THRESHOLD
+    )
+
+
+def _normalize_label(text: str | None) -> str:
+    """Lowercase and collapse separator runs so ``"Section Header"``,
+    ``"section_header"`` and ``"section-header"`` all compare equal."""
+    return re.sub(r"[\s_\-]+", " ", (text or "").strip().lower())
+
+
+# The header-label set, pre-normalised once so ``_is_header_anchor`` only has to
+# normalise its single input per call.
+_NORMALIZED_HEADER_ANCHOR_LABELS: frozenset[str] = frozenset(
+    _normalize_label(label) for label in RESEARCH_HEADER_ANCHOR_LABELS
+)
+
+
+def _is_header_anchor(*, label_text: str | None) -> bool:
+    """True when a citation anchor's annotation label denotes a section header
+    / heading rather than an operative passage (issue #2180).
+
+    Keyed on the annotation LABEL (``annotation_label.text``), matched case- and
+    separator-insensitively against ``RESEARCH_HEADER_ANCHOR_LABELS`` — NOT on
+    ``Annotation.structural``. ``structural`` marks the whole parser layout
+    layer (body paragraphs, tables, sentence chunks, …), so keying on it would
+    flag nearly every citation while missing the bookmark-derived OC_SECTION
+    headers that are ``structural=False``. See the constant's docstring.
+    """
+    return _normalize_label(label_text) in _NORMALIZED_HEADER_ANCHOR_LABELS
+
+
+# ---------------------------------------------------------------------------
+# Cite-span verification (issues #2189, #2200, #2201)
+# ---------------------------------------------------------------------------
+# Double-quoted passages: straight ("...") or curly (“...”), including a
+# mismatched pair (straight-open/curly-close or vice versa — LLM output
+# sometimes smart-quotes only one side). The inner group excludes every
+# double-quote glyph and newlines, so adjacent quotes (``"a" and "b"``) match
+# separately and a quote never runs past its close; it is length-capped
+# (``RESEARCH_QUOTE_MAX_CHARS``) so a lone unbalanced quote can't scan the whole
+# body. Single quotes / apostrophes (including the curly ’ U+2019) are
+# deliberately NOT matched — they collide with contractions and possessives.
+_QUOTED_PASSAGE_RE = re.compile(rf'["“]([^"“”\n]{{1,{RESEARCH_QUOTE_MAX_CHARS}}})["”]')
+
+# The cite placeholder, in both sanctioned forms — wrapping
+# (``<cite ids="1,2">claim</cite>``) and the self-closing pure marker
+# (``<cite ids="1,2"/>``, issue #2200) that attaches a footnote to the sentence
+# it follows without restating it. ``group(2)`` is None for the marker form.
+# Shared by the verifier and the renderer so both parse exactly one shape.
+_CITE_SPAN_RE = re.compile(
+    r'<cite\s+ids="([0-9,\s]+)"\s*(?:/>|>(.*?)</cite>)',
+    flags=re.DOTALL | re.IGNORECASE,
+)
+
+# Sentence/line boundary used to recover the prose a self-closing marker
+# decorates, and to compare a wrapping span against the prose before it.
+# The trailing ``\s`` is required, not incidental: it is what stops a decimal
+# ("the cap is 1.5 million") from reading as a sentence end. The ``(?<!\bno)``
+# lookbehind carves out the citation-number abbreviation for the same reason
+# ``_is_negated`` does (spelled out per-case because this regex, unlike the
+# negation check, runs on RAW text rather than the casefolded stream) —
+# without it "Exhibit No. 4 governs the term" splits at
+# the reference and the claim seen by the support check is truncated to
+# "4 governs the term", short enough to fall under the min-words floor and skip
+# the check entirely. The word boundary keeps it to a standalone "no", so
+# "casino." still ends a sentence.
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<!\b[Nn][Oo])[.!?:;]["”’)\]]*\s|\n')
+
+# A fenced code block delimiter (``` or ~~~). Heading detection is suspended
+# inside a fence: a ``# Sources`` COMMENT in a quoted snippet is not a heading,
+# and reading it as one used to swallow the rest of the block plus everything
+# after it, leaving an unterminated fence behind.
+_CODE_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+
+# A markdown ATX heading line, capturing its level (the run of ``#``) and its
+# title text. The level is what makes section stripping nesting-aware.
+_MD_HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+
+# Headings the SYSTEM owns. ``finalize`` writes the executive-summary header and
+# renders the Sources footnote table itself, so an agent-authored copy is
+# scaffolding leaking into the document (issue #2200: a stub "## Sources — (all
+# claims are cited inline)" line sat between two renderings of the report).
+# A sources-flavoured heading takes its whole section with it (up to the next
+# heading); the executive-summary heading is dropped on its own so the prose
+# beneath it survives as the summary.
+#
+# The two sets carry VERY different risk, which is why they are matched the way
+# they are. Matching is exact (after ``_normalize_label`` folds case and
+# separators) rather than by token or substring, and that is deliberate for the
+# SECTION set: a false positive there deletes every line up to the next heading,
+# and "Sources of Supply Risk", "References to Prior Agreements" and "Citations
+# in the Record" are all headings a real legal research report might carry. A
+# token-overlap rule strips all three. Losing a substantive section to a fuzzy
+# match is far worse than leaving one scaffolding heading in place.
+#
+# The cost of exactness is that a title just outside the set sails through and
+# reproduces #2200 under a different name, so the set enumerates the variants a
+# report generator actually reaches for. Extend it with more exact names when a
+# new one is observed; do not loosen the match.
+_SCAFFOLD_SECTION_HEADINGS: frozenset[str] = frozenset(
+    {
+        "sources",
+        "source",
+        "source list",
+        "list of sources",
+        "sources cited",
+        "references",
+        "reference",
+        "reference list",
+        "list of references",
+        "works cited",
+        "works consulted",
+        "citations",
+        "citation",
+        "footnotes",
+        "footnote",
+        "endnotes",
+        "endnote",
+        "bibliography",
+    }
+)
+# Dropping only the heading line, keeping the prose, is a small enough blast
+# radius that a bare "summary" earns its place here — a "## Summary" the agent
+# writes at the top of its own summary text lands directly under the system's
+# "## Executive Summary", which is the doubled-scaffolding symptom itself.
+_SCAFFOLD_HEADING_LINES: frozenset[str] = frozenset({"executive summary", "summary"})
+
+# Punctuation trimmed from token edges before a token is compared. Shared by
+# ``_content_words`` and ``_is_negated`` so both agree on where a token ends.
+_TOKEN_PUNCTUATION = "\"“”'’()[]{}.,;:!?*_`"
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    """Casefold + collapse all whitespace runs to single spaces.
+
+    Mirrors ``opencontractserver.utils.annotation_anchoring._norm`` so quote
+    verification uses the same notion of "the same words" the anchor pipeline
+    does: newline / indentation differences between a PDF's ``raw_text`` and a
+    quoted passage don't count as a mismatch, and matching is case-insensitive
+    (the fabrication risk is invented WORDS, not case).
+    """
+    return " ".join((text or "").casefold().split())
+
+
+def _contiguous_coverage(needle_norm: str, haystack_norm: str) -> float:
+    """Fraction of ``needle_norm`` covered by its longest run inside
+    ``haystack_norm`` (both already whitespace-/case-normalized).
+
+    ``difflib``'s longest-contiguous-block, expressed as coverage of the needle
+    — a stricter test than ``SequenceMatcher.ratio()`` that a real run of the
+    needle appears verbatim. Shared by quote verification (#2189) and the
+    duplicate-summary / echoed-cite guards (#2200) so "is this text a copy of
+    that text" means one thing everywhere.
+    """
+    if not needle_norm or not haystack_norm:
+        return 0.0
+    if needle_norm in haystack_norm:
+        return 1.0
+    matcher = SequenceMatcher(None, needle_norm, haystack_norm, autojunk=False)
+    block = matcher.find_longest_match(0, len(needle_norm), 0, len(haystack_norm))
+    return block.size / len(needle_norm)
+
+
+def _quote_is_grounded(quote: str, candidates_norm: list[str]) -> bool:
+    """True when ``quote`` is verbatim (modulo whitespace/case) in a candidate.
+
+    ``candidates_norm`` are the pre-normalized ``raw_text`` values of the
+    annotations a ``<cite>`` span cites. A quote shorter than
+    ``RESEARCH_QUOTE_MIN_WORDS`` words is treated as grounded (not a passage
+    claim — see the constant). Otherwise the quote must share a single
+    contiguous run covering ``RESEARCH_QUOTE_MATCH_THRESHOLD`` of its length
+    with some candidate (an exact substring scores 1.0; the fuzzy band tolerates
+    a trailing-punctuation / whitespace / single-character drift).
+    """
+    q = _normalize_for_quote_match(quote)
+    if len(q.split()) < RESEARCH_QUOTE_MIN_WORDS:
+        return True
+    return any(
+        _contiguous_coverage(q, cand) >= RESEARCH_QUOTE_MATCH_THRESHOLD
+        for cand in candidates_norm
+        if cand
+    )
+
+
+def _content_words(text: str) -> set[str]:
+    """Meaning-bearing tokens of ``text``: normalized, stopwords and tokens
+    shorter than ``RESEARCH_SUPPORT_MIN_TOKEN_CHARS`` removed.
+
+    Punctuation is trimmed but internal hyphens/slashes are kept, so
+    ``fixed-price`` stays one distinctive term rather than dissolving into two
+    common ones.
+    """
+    words: set[str] = set()
+    for token in _normalize_for_quote_match(text).split():
+        token = token.strip(_TOKEN_PUNCTUATION)
+        if not token:
+            continue
+        # Digit-bearing tokens skip the length floor: "10", "5%" and "$5" are
+        # short but are exactly the figures a report must not fabricate, and
+        # dropping them left the ratio with no signal either way. See the
+        # constant for why numeric *parity* is deliberately not enforced.
+        if len(token) < RESEARCH_SUPPORT_MIN_TOKEN_CHARS and not any(
+            ch.isdigit() for ch in token
+        ):
+            continue
+        if token in RESEARCH_SUPPORT_STOPWORDS:
+            continue
+        words.add(token)
+    return words
+
+
+def _is_negated(text: str) -> bool:
+    """True when ``text`` carries an explicit negation marker.
+
+    Matches both a negating particle ("not", "without", …) and a negating
+    prefix ("non-cancelable"), since contracts use the two interchangeably and a
+    token-exact test would miss the whole prefixed family.
+
+    One exception: "no" also spells the citation-number abbreviation ("Exhibit
+    No. 4", "Schedule No. A-1"), which is not a negation at all. Reading it as
+    one let a reference that appears on only one side of an otherwise
+    near-verbatim restatement trip the inversion guard and strip a VALID
+    citation.
+
+    The discriminator is the abbreviating period on the token itself, not what
+    follows it: bare "no" negates, "no." abbreviates. That covers lettered
+    references ("No. A-1") as well as numeric ones, and — unlike looking ahead
+    for a number — it does not swallow a genuine negation that happens to
+    precede one ("no 30-day cure period").
+
+    The period cannot tell an abbreviation from a one-word answer, so a bare
+    "No." ending a sentence reads as the abbreviation and does not negate.
+    Accepted: it errs toward NOT firing the inversion guard, which costs
+    strictness rather than attribution, and a standalone "No." as a whole
+    sentence is vanishingly rare in the report prose this runs over.
+
+    Deliberately keyed on the normalized token stream rather than
+    ``_content_words``, so the stopword list (which contains "not") cannot hide
+    a polarity marker from the inversion guard.
+    """
+    for raw in _normalize_for_quote_match(text).split():
+        token = raw.strip(_TOKEN_PUNCTUATION)
+        if token in RESEARCH_SUPPORT_NEGATION_TOKENS:
+            # ``"." in raw`` rather than ``raw.endswith(".")`` so a bracketed
+            # reference ("(No. 4)") is still recognised as the abbreviation.
+            if token == "no" and "." in raw:
+                continue
+            return True
+        if token.startswith(RESEARCH_SUPPORT_NEGATION_PREFIXES):
+            return True
+    return False
+
+
+def _claim_is_supported(claim: str, candidates_norm: list[str]) -> bool:
+    """True when the cited annotation(s) plausibly SAY what ``claim`` asserts
+    (issue #2201) — the generalization of #2189's "is the quote verbatim".
+
+    Deterministic lexical floor: at least ``RESEARCH_CLAIM_SUPPORT_MIN_COVERAGE``
+    of the claim's content words must occur in the union of the cited anchors'
+    text. Claims shorter than ``RESEARCH_CLAIM_SUPPORT_MIN_WORDS`` words are
+    accepted unchecked — a fragment has too few content words for a ratio to
+    mean anything. A checked claim with NO usable anchor text (textless anchor,
+    deleted row, id that was never retrieved) is unsupported by construction.
+
+    See the constants for the calibration and for what this deliberately does
+    NOT catch (a well-anchored sentence carrying an invented tail).
+
+    The polarity guard has two known limitations, both pinned by tests:
+
+    * It treats the cited anchors as a union, matching the coverage check
+      above. A span citing several anchors that disagree on polarity therefore
+      satisfies parity whichever way the claim reads, so an inversion against
+      one of them can pass. Making polarity per-candidate while coverage stays
+      a union would be the inconsistency, not the fix.
+    * It reads polarity off a fixed marker lexicon, so an anchor that negates
+      lexically ("obligations *excluding* painting") reads as affirmative and a
+      faithful claim restating it with "not" looks like an inversion. Above the
+      coverage gate that costs a valid citation. The failure is one-directional
+      — an over-strip, never a fabricated attribution — which is the right way
+      round here, and the coverage gate keeps looser paraphrases clear of it.
+
+    Both point at the same honest fix: the entailment call this function is the
+    seam for. Widening the lexicon would only move the boundary, not remove it.
+    """
+    if len(claim.split()) < RESEARCH_CLAIM_SUPPORT_MIN_WORDS:
+        return True
+    claim_words = _content_words(claim)
+    if not claim_words:
+        return True
+    anchor_words: set[str] = set()
+    for cand in candidates_norm:
+        anchor_words |= _content_words(cand)
+    if not anchor_words:
+        return False
+    covered = len(claim_words & anchor_words) / len(claim_words)
+    if covered < RESEARCH_CLAIM_SUPPORT_MIN_COVERAGE:
+        return False
+
+    # Polarity guard. Word overlap cannot see negation, so a claim that inverts
+    # its anchor ("the tenant is NOT liable…" against "the tenant is liable…")
+    # scores like a faithful paraphrase. When the claim otherwise reads as a
+    # near-verbatim restatement, a disagreement about whether a negation marker
+    # is present is a meaning inversion, not a rephrasing — see the constants.
+    if covered >= RESEARCH_CLAIM_INVERSION_COVERAGE:
+        if _is_negated(claim) != any(_is_negated(cand) for cand in candidates_norm):
+            return False
+    return True
+
+
+def party_named_in_passages(party: str, passages: Sequence[str]) -> bool:
+    """True when at least one cited passage actually NAMES ``party``.
+
+    The narrowest useful entailment test there is, and the one an obligation
+    card most needs. Two adversarial reviewers reading the same report landed
+    on the same defect from opposite directions — "the passage supports the
+    $50,000/MW figure but does not itself specify who must post it" and "duties
+    the ILLE bears are at times assigned to the TSP". Both are one failure: the
+    card names an obligor its evidence never mentions, and word-overlap over
+    the *claim* cannot see it, because the claim scores fine on everything
+    except the one word that matters.
+
+    Deliberately lenient — ANY distinctive token of the party string appearing
+    anywhere in the union of cited passages is enough. It is not asking "does
+    this passage impose the duty on this party", which needs an entailment
+    call; it is asking "is this party in the evidence at all", which is cheap,
+    deterministic, and catches the attribution invented wholesale. Acronyms are
+    matched too (``TSP``, ``ILLE``), because a three-letter defined term is
+    usually the *most* distinctive part of a party name and is exactly what
+    ``_content_words``' length floor would otherwise drop.
+
+    Fails closed when the citations carry no usable text, matching
+    :func:`_claim_is_supported`: a citation with nothing to read is not
+    evidence, and the remedy — cite the passage that names the obligor — is the
+    same one the caller's error message asks for.
+    """
+    needles = _content_words(party)
+    # Acronyms come off the RAW string: casefolding happens after, so an
+    # all-caps run is still visible as one. Two chars is deliberate ("DSP",
+    # "IE"); a one-letter "run" is noise.
+    needles |= {
+        token.strip(_TOKEN_PUNCTUATION).casefold()
+        for token in (party or "").split()
+        if len(token.strip(_TOKEN_PUNCTUATION)) >= 2
+        and token.strip(_TOKEN_PUNCTUATION).isupper()
+    }
+    needles = {needle for needle in needles if needle}
+    if not needles:
+        # Nothing distinctive to look for (a party written entirely in
+        # stopwords). Not a judgement that it is grounded — a judgement that
+        # this check cannot make one.
+        return True
+    haystack = " ".join(_normalize_for_quote_match(p) for p in passages if p)
+    if not haystack.strip():
+        return False
+    return any(needle in haystack for needle in needles)
+
+
+def _preceding_claim(text: str) -> tuple[int, str]:
+    """Return ``(start_offset, segment)`` for the sentence ``text`` ends on.
+
+    ``segment`` is the last non-blank sentence/line of ``text`` and always runs
+    to its end, so a caller can splice a rewritten version back in with
+    ``text[:start_offset] + rewritten``. Used for both halves of the
+    self-quoting fix (#2200): it is the prose a wrapping span may be echoing,
+    and the sentence a self-closing ``<cite ids="…"/>`` marker decorates.
+    Lookback is bounded by ``RESEARCH_SENTENCE_LOOKBACK_CHARS``.
+
+    Known limitation: only ``No.`` is carved out of the boundary rule, so other
+    legal abbreviations (``Inc.``, ``Corp.``, ``U.S.C.``, ``e.g.``) still split
+    a sentence and hand the guards a truncated claim. That is deliberate rather
+    than unfinished. ``No.`` is unambiguous — a reference identifier always
+    follows it, so it is never a sentence end. ``Inc.``/``Corp.`` genuinely end
+    sentences in filing prose ("...acquired by Karman Holdings Inc. The
+    transaction closed..."), so suppressing the boundary there would MERGE two
+    sentences into one claim. The two errors are not symmetric: truncation
+    shortens the claim and fails open (the check is skipped or scores higher),
+    whereas merging pads it with unrelated vocabulary and erodes the coverage
+    margin toward a false strip — measured at 1.00 -> 0.40 for one unrelated
+    preceding sentence, which stays above the floor but spends most of the
+    headroom. Prefer the failing-open error until this uses real sentence
+    segmentation.
+    """
+    head = text[-RESEARCH_SENTENCE_LOOKBACK_CHARS:]
+    base = len(text) - len(head)
+    start = 0
+    last_nonblank = 0
+    for match in _SENTENCE_BOUNDARY_RE.finditer(head):
+        if head[start : match.end()].strip():
+            last_nonblank = start
+        start = match.end()
+    if head[start:].strip():
+        last_nonblank = start
+    return base + last_nonblank, head[last_nonblank:]
+
+
+def _strip_ungrounded_quotes(claim: str, candidates_norm: list[str]) -> tuple[str, int]:
+    """Drop quotation marks around passages in ``claim`` that no cited
+    annotation supports. Returns ``(cleaned_claim, downgraded_count)``.
+
+    Only the quotation marks are removed — the prose is preserved — so an
+    ungrounded "quote" degrades honestly to the agent's own paraphrase rather
+    than masquerading as a verbatim citation (issue #2189).
+    """
+    downgraded = 0
+
+    def _replace(match: re.Match[str]) -> str:
+        nonlocal downgraded
+        inner = match.group(1)
+        if _quote_is_grounded(inner, candidates_norm):
+            return match.group(0)
+        downgraded += 1
+        return inner
+
+    return _QUOTED_PASSAGE_RE.sub(_replace, claim), downgraded
+
+
+class CiteVerification(NamedTuple):
+    """Outcome of :func:`_verify_cite_spans`."""
+
+    markdown: str
+    quotes_demoted: int
+    cites_dropped: int
+    echoes_trimmed: int
+
+
+def _verify_cite_spans(
+    markdown: str, allowed_annotation_ids: set[int]
+) -> CiteVerification:
+    """Walk every ``<cite>`` span once and enforce the three citation guards.
+
+    Per span, against the ``raw_text`` of the annotation(s) it cites:
+
+    1. **Echo collapse** (#2200) — a wrapping span whose inner text merely
+       restates the prose immediately before it collapses to the self-closing
+       marker form, so the claim renders once with a trailing footnote instead
+       of twice. The threshold is a ratio over the INNER text, so any tail the
+       span adds beyond the restatement shrinks it: on a typical sentence a
+       tail of more than about a word already falls under
+       ``RESEARCH_CITE_ECHO_THRESHOLD`` and the span is left intact. What can
+       still be lost is bounded by that same ratio, and a collapse that is not
+       total is counted (``echoes_trimmed``) so it is reported rather than
+       silent.
+    2. **Quote verification** (#2189) — a quoted passage that is not verbatim in
+       the cited text loses its quotation marks (prose and footnote preserved),
+       so a fabricated quote degrades honestly to paraphrase.
+    3. **Claim support** (#2201) — a cited sentence whose anchor text does not
+       support it loses the citation entirely; the prose survives as uncited
+       analysis. See :func:`_claim_is_supported`.
+
+    The "claim" a span asserts is its inner text, or — for a self-closing
+    marker, and for a span collapsed by (1) — the text it follows, so the guards
+    apply to both sanctioned cite forms. Returns the rewritten markdown plus the
+    three counts ``finalize`` turns into warnings.
+
+    That trailing text runs back to the previous span or the sentence boundary,
+    whichever is nearer, so in a compound sentence each marker is checked
+    against ITS OWN clause rather than the whole sentence: in
+    ``… pay taxes <cite ids="1"/> and maintain insurance <cite ids="2"/>``,
+    anchor 2 answers for the insurance clause alone. That is the right scope —
+    the alternative would judge every anchor in the sentence against the union
+    of all of them — but it means a clause under
+    ``RESEARCH_CLAIM_SUPPORT_MIN_WORDS`` passes unchecked, exactly as any short
+    claim does anywhere else. A clause long enough to check IS checked, and a
+    mis-anchored one loses its citation.
+
+    A span whose cited ids yield NO usable text (textless anchor, deleted row,
+    or an id retrieval never produced) is treated as ungrounded by both (2) and
+    (3) rather than silently passing through — that is the "cited a real anchor
+    but invented the content" hole these guards exist to close.
+
+    The guards are independent, so one badly-anchored span can trip (2) and (3)
+    both, and ``finalize`` will then warn about a demoted quote AND a removed
+    citation for what reads as a single sentence. That is intended: the two
+    remediations are different and both land in the output the reader sees. The
+    quotation marks come off (so no fabricated verbatim survives) and the
+    footnote comes off (so the sentence is not attributed) — reporting only one
+    would leave the other edit unexplained.
+
+    Known asymmetry across split markers: when the agent writes
+    ``… <cite ids="1"/> <cite ids="2"/>`` instead of the combined
+    ``<cite ids="1,2"/>`` the prompt asks for, the carried-forward claim feeds
+    (3) but not (2) — the later marker's ``preceding`` is the blank gap between
+    the tags, so quotes were already verified at the first marker against ITS
+    anchors alone. This can only over-strip: a quote grounded in the second
+    anchor but not the first is demoted to paraphrase (honest, and the warning
+    tells the reader to check the wording). It cannot under-strip — a quote in
+    NEITHER anchor is still demoted at the first marker, so nothing ungrounded
+    reaches the reader through the split form. Unioning candidates across a run
+    of adjacent markers would fix the strictness; it is not worth a lookahead
+    pre-pass for a shape the prompt forbids.
+    """
+    spans = list(_CITE_SPAN_RE.finditer(markdown or ""))
+    if not spans:
+        return CiteVerification(markdown, 0, 0, 0)
+
+    # Hydrate every cited, allowed annotation's text in ONE query (no N+1),
+    # normalized once and cached by id. Ids outside ``allowed_annotation_ids``
+    # are excluded here, so a span citing only such ids gets no candidates.
+    all_ids: set[int] = {
+        ann_id
+        for match in spans
+        for ann_id in _parse_ids(match.group(1))
+        if ann_id in allowed_annotation_ids
+    }
+    norm_by_id: dict[int, str] = {}
+    if all_ids:
+        from opencontractserver.annotations.models import Annotation
+
+        norm_by_id = {
+            pk: _normalize_for_quote_match(raw or "")
+            for pk, raw in Annotation.objects.filter(pk__in=all_ids).values_list(
+                "pk", "raw_text"
+            )
+        }
+
+    out: list[str] = []
+    cursor = 0
+    quotes_demoted = 0
+    cites_dropped = 0
+    echoes_trimmed = 0
+    last_claim = ""
+
+    for match in spans:
+        out.append(markdown[cursor : match.start()])
+        cursor = match.end()
+        ids_raw = match.group(1)
+        inner = match.group(2)  # None for the self-closing marker form
+        # An empty or whitespace-only wrapping span asserts nothing, so it IS a
+        # marker and must be treated as one. Left as "", it skipped the echo
+        # check, produced an empty claim, and fell through to the carried-over
+        # ``last_claim`` — so the span was judged against a PREVIOUS sentence,
+        # or against nothing at all when it came first. Either way the guards
+        # let it stand where the marker form on the same text drops it, which
+        # is a hole straight through (3). Normalising here keeps the two forms
+        # on one code path rather than documenting the divergence.
+        if inner is not None and not inner.strip():
+            inner = None
+        candidates = [norm_by_id[i] for i in _parse_ids(ids_raw) if norm_by_id.get(i)]
+
+        preceding_offset, preceding = _preceding_claim(out[-1])
+
+        # (1) Echo collapse — inner text that just restates the prose before it.
+        if inner:
+            inner_norm = _normalize_for_quote_match(inner)
+            preceding_norm = _normalize_for_quote_match(preceding)
+            # The inner text is the ONE input here the caller does not bound:
+            # ``_preceding_claim`` caps its side at RESEARCH_SENTENCE_LOOKBACK_CHARS
+            # and quote extraction caps its own, but a <cite> span's inner group
+            # is whatever the agent wrote, and SequenceMatcher costs time linear
+            # in it. It is also unnecessary work: coverage divides the longest
+            # matching block by len(inner), and that block cannot exceed
+            # len(preceding), so coverage <= len(preceding)/len(inner). Once
+            # len(inner) * threshold passes len(preceding) the threshold is
+            # arithmetically out of reach and the comparison can be skipped.
+            # Exact, not heuristic — the result is identical, just not computed.
+            # (Capping the REGEX instead, as for quoted passages, would not be:
+            # an unmatched quote pattern leaves text alone, but an unmatched
+            # cite span is never rendered either, leaking a raw tag into the
+            # report — the #2200 symptom.)
+            if len(inner_norm) * RESEARCH_CITE_ECHO_THRESHOLD > len(preceding_norm):
+                echo = 0.0
+            else:
+                echo = _contiguous_coverage(inner_norm, preceding_norm)
+            if echo >= RESEARCH_CITE_ECHO_THRESHOLD:
+                # A collapse below full coverage discards the uncovered
+                # remainder along with the echo, so count it — every other
+                # strip in this pipeline is reported, and this one should not
+                # be the exception. Gated on the loss, not the collapse: an
+                # exact echo (the observed shape, and 1.0 even when only
+                # punctuation differs) loses nothing and stays silent.
+                if echo < 1.0:
+                    echoes_trimmed += 1
+                inner = None
+
+        # (2) Quote verification, applied to whichever text carries the claim.
+        # For a marker, that text already sits in the emitted tail, so the
+        # rewrite is spliced back into it.
+        if inner is not None:
+            inner, demoted = _strip_ungrounded_quotes(inner, candidates)
+            claim = inner
+        else:
+            cleaned, demoted = _strip_ungrounded_quotes(preceding, candidates)
+            if demoted and out:
+                out[-1] = out[-1][:preceding_offset] + cleaned
+            claim = cleaned
+        quotes_demoted += demoted
+
+        # The claim is the text immediately before the span, so consecutive
+        # markers on one sentence (``… <cite ids="1"/> <cite ids="2"/>`` instead
+        # of the combined ``<cite ids="1,2"/>`` the prompt asks for) leave the
+        # later span nothing but the whitespace between the tags. Carry the
+        # previous span's claim forward so the second anchor is checked against
+        # the sentence it decorates rather than passing unchecked as a fragment.
+        if not claim.strip():
+            claim = last_claim
+        last_claim = claim
+
+        # (3) Claim support — an unsupported sentence keeps its prose, loses
+        # its footnote. A marker with NO prose before it at all (the degenerate
+        # case of one opening the document) yields an empty claim, which falls
+        # under the min-words floor and is left alone: there is no sentence for
+        # the anchor to misrepresent, so there is nothing to strip.
+        if not _claim_is_supported(claim, candidates):
+            cites_dropped += 1
+            out.append(inner or "")
+            continue
+
+        out.append(
+            f'<cite ids="{ids_raw}"/>'
+            if inner is None
+            else f'<cite ids="{ids_raw}">{inner}</cite>'
+        )
+
+    out.append(markdown[cursor:])
+    return CiteVerification("".join(out), quotes_demoted, cites_dropped, echoes_trimmed)
+
+
+def _render_citations(
+    markdown_body: str, allowed_annotation_ids: set[int]
+) -> tuple[str, list[dict]]:
+    """Convert ``<cite ids="...">claim</cite>`` and ``<cite ids="..."/>``
+    placeholders into footnotes.
+
+    Returns ``(rendered_markdown, citations_table)``. The citations table
+    is ordered by first appearance; each entry has ``footnote``,
+    ``annotation_id``, ``document_id``, ``page``, ``raw_text``,
+    ``similarity_score``, and a ``display`` string suitable for the
+    ``## Sources`` block.
+
+    Citations referring to annotations not in ``allowed_annotation_ids``
+    are silently dropped — the agent shouldn't have produced them
+    (``arecord_finding`` validates), but we keep this defensive so a
+    rogue finding never produces a broken markdown link.
+    """
+    from opencontractserver.annotations.models import Annotation
+
+    # Shared with the verifier (_verify_cite_spans) so both parse the same cite
+    # placeholder shape.
+    pattern = _CITE_SPAN_RE
+
+    # First pass: assign footnote numbers to unique (filtered) annotation ids
+    # in order of appearance.
+    footnote_for_id: dict[int, int] = {}
+    next_footnote = 1
+    for match in pattern.finditer(markdown_body):
+        ids = _parse_ids(match.group(1))
+        for ann_id in ids:
+            if ann_id not in allowed_annotation_ids:
+                continue
+            if ann_id not in footnote_for_id:
+                footnote_for_id[ann_id] = next_footnote
+                next_footnote += 1
+
+    # Fetch annotation metadata in one query for the Sources block.
+    # ``annotation_label`` is pulled so the weak-citation lint (#2180) can read
+    # the anchor's label without an N+1.
+    annotations_by_id = {
+        ann.pk: ann
+        for ann in Annotation.objects.filter(
+            pk__in=footnote_for_id.keys()
+        ).select_related("document", "annotation_label")
+    }
+
+    def _replace(match: re.Match[str]) -> str:
+        ids = _parse_ids(match.group(1))
+        # None for the self-closing marker form: the claim is the prose the
+        # marker follows, which stays exactly where it is.
+        claim = match.group(2) or ""
+        markers: list[str] = []
+        for ann_id in ids:
+            if ann_id in footnote_for_id:
+                markers.append(f"[^{footnote_for_id[ann_id]}]")
+        if not markers:
+            # All ids were filtered out — render the claim alone so the
+            # reader still gets the prose without a dangling footnote.
+            return claim
+        return f"{claim}{''.join(markers)}"
+
+    rendered = pattern.sub(_replace, markdown_body)
+
+    citations: list[dict] = []
+    for ann_id, footnote in sorted(footnote_for_id.items(), key=lambda kv: kv[1]):
+        ann = annotations_by_id.get(ann_id)
+        if ann is None:
+            # Annotation was deleted between agent run and finalize.
+            continue
+        raw_text = (getattr(ann, "raw_text", "") or "")[:240]
+        page = getattr(ann, "page", None)
+        doc = getattr(ann, "document", None)
+        doc_title = getattr(doc, "title", "") if doc else ""
+        doc_id = getattr(doc, "id", None)
+        display_parts = []
+        if doc_title:
+            display_parts.append(f"*{doc_title}*")
+        if doc_id is not None:
+            display_parts.append(f"(doc {doc_id})")
+        if page is not None:
+            display_parts.append(f"page {page}")
+        display_parts.append(f"annotation {ann_id}")
+        if raw_text:
+            display_parts.append(f"— “{raw_text}”")
+        citations.append(
+            {
+                "footnote": footnote,
+                "annotation_id": ann_id,
+                "document_id": doc_id,
+                "page": page,
+                "raw_text": raw_text,
+                # Flag anchors whose annotation label is a section header /
+                # heading so finalize can surface a weak-citation warning and
+                # any future automated citation-checking can key off it (#2180).
+                "anchor_is_header": _is_header_anchor(
+                    label_text=getattr(
+                        getattr(ann, "annotation_label", None), "text", None
+                    ),
+                ),
+                "display": " ".join(display_parts),
+            }
+        )
+
+    return rendered, citations
+
+
+def _cited_ids_in(markdown: str) -> set[int]:
+    """Every annotation id a ``<cite>`` span in ``markdown`` names.
+
+    Unfiltered on purpose — the caller decides which of these are allowed. Uses
+    the same regex and id parser as the verifier so "what the document cites"
+    means one thing across the pipeline.
+    """
+    return {
+        ann_id
+        for match in _CITE_SPAN_RE.finditer(markdown or "")
+        for ann_id in _parse_ids(match.group(1))
+    }
+
+
+def _parse_ids(group: str) -> list[int]:
+    out: list[int] = []
+    for token in (group or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return out

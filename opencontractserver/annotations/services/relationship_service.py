@@ -1,0 +1,330 @@
+"""Relationship read-service — permission-filtered relationship queries.
+
+Relocated verbatim from the former ``annotations/query_optimizer.py``
+``RelationshipQueryOptimizer`` monolith as Phase 3 of the service-layer
+centralization roadmap — see
+``docs/refactor_plans/2026-05-19-service-layer-centralization-design.md``.
+
+Behaviour is preserved exactly — this is a relocation, not a rewrite.
+"""
+
+from typing import Optional
+
+from django.db.models import BooleanField, Case, Count, Q, QuerySet, Value, When
+
+from opencontractserver.annotations.services.annotation_service import (
+    AnnotationService,
+)
+from opencontractserver.shared.services import BaseService
+
+# ``source_visibility`` imports stay inside methods below: importing that module
+# at file load time creates Django app-loading cycles through models/managers.
+
+
+class RelationshipService(BaseService):
+    """
+    Optimized relationship queries without caching.
+
+    Permission model:
+    - Uses same document+corpus permission model as annotations
+    - Document permissions are primary (most restrictive)
+    - Corpus permissions are secondary
+    - Effective permission = MIN(document_permission, corpus_permission)
+    """
+
+    @classmethod
+    def get_document_relationships(
+        cls,
+        document_id: int,
+        user,
+        corpus_id: Optional[int] = None,
+        analysis_id: Optional[int] = None,
+        pages: Optional[list[int]] = None,
+        structural: Optional[bool] = None,
+        extract_id: Optional[int] = None,
+        strict_extract_mode: bool = False,
+        context=None,
+    ) -> QuerySet:
+        """
+        Get relationships with optimized prefetching.
+        Permissions are computed at document+corpus level.
+
+        IMPORTANT: Returns relationships from BOTH:
+        1. Direct document relationships (document FK) - corpus-specific relationships
+        2. Structural relationships via document's structural_annotation_set (structural_set FK) - shared relationships
+
+        ``context`` allows the request-level caches in
+        ``AnnotationService._compute_effective_permissions`` /
+        ``_get_document_for_request`` to be shared with the annotation resolver
+        in the same GraphQL operation.
+        """
+        from opencontractserver.annotations.models import Relationship
+
+        # Use unified permission check from AnnotationService.
+        # Pass context so the result is cached for the rest of the request.
+        can_read, can_create, can_update, can_delete, can_comment = (
+            AnnotationService._compute_effective_permissions(
+                user, document_id, corpus_id, context=context
+            )
+        )
+
+        if not can_read:
+            return Relationship.objects.none()
+
+        # Fetch document via the request cache (same instance as the annotation
+        # resolver uses, when both run in the same GraphQL request).
+        document = AnnotationService._get_document_for_request(document_id, context)
+        if document is None:
+            return Relationship.objects.none()
+
+        # Build base filter for relationships from BOTH sources:
+        # 1. Direct document relationships (corpus-specific, user-created)
+        # 2. Structural relationships via document's structural_annotation_set (shared)
+        doc_filters = Q(document_id=document_id)
+
+        if document.structural_annotation_set_id:
+            # Include structural relationships from the shared set
+            # These relationships have document_id=NULL but structural_set_id=X
+            doc_filters |= Q(
+                structural_set_id=document.structural_annotation_set_id,
+                structural=True,  # Safety check - structural_set relationships must be structural
+            )
+
+        # Build query with combined document filters
+        qs = Relationship.objects.filter(doc_filters)
+
+        # Apply privacy filtering for created_by_* fields (same gate as
+        # Annotations). Applies to ALL users including superusers (scoped admin
+        # access, 2026-05): an admin only sees analysis-/extract-private
+        # relationships it can actually reach. The shared gate honours
+        # user- AND group-level guardian grants (parity with ``user_can``'s
+        # privacy recursion) and encodes the anonymous rules (public analyses
+        # only; never extracts).
+        from opencontractserver.utils.source_visibility import (
+            apply_source_privacy_gate,
+        )
+
+        qs = apply_source_privacy_gate(qs, user)
+
+        if corpus_id:
+            # Filter by corpus (permissions already checked)
+            # IMPORTANT: Structural_set relationships have corpus_id=NULL (they're shared across corpuses)
+            # So we need to keep BOTH:
+            # 1. Corpus-specific relationships where corpus_id matches
+            # 2. Structural_set relationships (which have corpus_id=NULL but structural_set_id set)
+            corpus_filter = Q(corpus_id=corpus_id)
+
+            if document.structural_annotation_set_id:
+                # Also keep structural relationships from this document's set
+                # (already filtered in base query, but corpus_id=NULL so we must explicitly allow them)
+                corpus_filter |= Q(
+                    structural_set_id=document.structural_annotation_set_id,
+                    structural=True,
+                )
+
+            qs = qs.filter(corpus_filter)
+        else:
+            # No corpus = structural only (always readable if doc is readable)
+            qs = qs.filter(structural=True)
+
+        if analysis_id is not None:
+            if analysis_id == 0:  # Special case for user relationships
+                qs = qs.filter(analysis__isnull=True)
+            else:
+                # Check analysis visibility as additional restriction
+                from opencontractserver.analyzer.models import Analysis
+                from opencontractserver.types.enums import PermissionTypes
+
+                try:
+                    analysis = Analysis.objects.get(id=analysis_id)
+                    user_id = getattr(user, "id", None)
+                    # User can see relationships if: analysis is public, user is creator,
+                    # OR has explicit READ permission
+                    has_permission = (
+                        analysis.is_public
+                        or (
+                            analysis.creator_id is not None
+                            and analysis.creator_id == user_id
+                        )
+                        or analysis.user_can(
+                            user, PermissionTypes.READ, request=context
+                        )
+                    )
+                    if not has_permission:
+                        return Relationship.objects.none()
+                except Analysis.DoesNotExist:
+                    return Relationship.objects.none()
+                qs = qs.filter(analysis_id=analysis_id)
+        else:
+            # When analysis_id is not provided (None), exclude analysis relationships
+            # We only want user/manual relationships in this case
+            qs = qs.filter(analysis__isnull=True)
+
+        if structural is not None:
+            qs = qs.filter(structural=structural)
+
+        if pages:
+            # Filter relationships where source or target annotations are on specified pages
+            qs = qs.filter(
+                Q(source_annotations__page__in=pages)
+                | Q(target_annotations__page__in=pages)
+            ).distinct()
+
+        if extract_id:
+            # Filter to relationships connected to annotations used in extract
+            from opencontractserver.extracts.models import Datacell
+
+            datacell_annotation_ids = Datacell.objects.filter(
+                extract_id=extract_id, document_id=document_id
+            ).values_list("sources__id", flat=True)
+
+            if strict_extract_mode:
+                # Both source and target must be in extract
+                qs = qs.filter(
+                    source_annotations__id__in=datacell_annotation_ids,
+                    target_annotations__id__in=datacell_annotation_ids,
+                )
+            else:
+                # Either source or target in extract
+                qs = qs.filter(
+                    Q(source_annotations__id__in=datacell_annotation_ids)
+                    | Q(target_annotations__id__in=datacell_annotation_ids)
+                )
+
+        # Structural rows are writable ONLY via the superuser break-glass
+        # (see ``RelationshipManager.user_can``); reflect that in the
+        # pre-computed myPermissions so the UI mirrors what mutations will
+        # actually allow (2026-06 permissioning audit — annotations already
+        # masked structural writes; relationships previously reported the
+        # raw doc+corpus values on structural rows).
+        user_is_superuser = bool(getattr(user, "is_superuser", False))
+
+        # Optimize with prefetches and annotate with computed permissions
+        qs = (
+            qs.select_related("relationship_label", "creator")
+            .prefetch_related(
+                "source_annotations__annotation_label",
+                "target_annotations__annotation_label",
+            )
+            .annotate(
+                # Store computed permissions for backwards compatibility
+                _can_read=Value(can_read),
+                _can_create=Value(can_create),
+                _can_update=Case(
+                    When(structural=True, then=Value(user_is_superuser)),
+                    default=Value(can_update),
+                    output_field=BooleanField(),
+                ),
+                _can_delete=Case(
+                    When(structural=True, then=Value(user_is_superuser)),
+                    default=Value(can_delete),
+                    output_field=BooleanField(),
+                ),
+                _can_comment=Value(can_comment),
+            )
+            .distinct()
+        )
+
+        return qs
+
+    @classmethod
+    def get_relationship_summary(cls, document_id: int, corpus_id: int, user) -> dict:
+        """
+        Get relationship counts by type.
+        """
+        from opencontractserver.annotations.models import Relationship
+
+        # Use unified permission check
+        can_read, _, _, _, _ = AnnotationService._compute_effective_permissions(
+            user, document_id, corpus_id
+        )
+
+        if not can_read:
+            return {"total": 0, "by_type": {}}
+
+        from opencontractserver.utils.source_visibility import (
+            apply_source_privacy_gate,
+        )
+
+        # Privacy gate (2026-06 audit): without it, the counts and label
+        # names of analysis-/extract-private relationships leaked into the
+        # aggregate for viewers who could not see the rows themselves.
+        summary = (
+            apply_source_privacy_gate(
+                Relationship.objects.filter(
+                    document_id=document_id, corpus_id=corpus_id
+                ),
+                user,
+            )
+            .values("relationship_label__text")
+            .annotate(count=Count("id"))
+        )
+
+        result = {
+            "total": sum(item["count"] for item in summary),
+            "by_type": {
+                item["relationship_label__text"]: item["count"]
+                for item in summary
+                if item["relationship_label__text"]
+            },
+        }
+
+        return result
+
+    @classmethod
+    def get_corpus_relationships(
+        cls,
+        corpus_id: int,
+        user,
+        structural: Optional[bool] = None,
+    ) -> QuerySet:
+        """Corpus-wide relationships visible to ``user``.
+
+        Mirrors ``AnnotationService.get_corpus_annotations`` scoping: includes
+        corpus-FK relationships, relationships on visible corpus documents, and
+        structural relationships linked via those documents' structural sets.
+
+        Corpus READ is the gate (via ``CorpusDocumentService.get_corpus_documents``
+        — **corpus-as-gate semantics, issue #1682**: deliberate, because the
+        sole caller is the MCP corpus tool surface
+        (``opencontractserver/mcp/tools.py``), the documented default for
+        pipeline-facing callers operating over a whole readable corpus.
+        A future user-facing GraphQL caller MUST switch this to
+        ``get_corpus_documents_visible_to_user``); returns
+        ``Relationship.objects.none()`` if the corpus is not visible.
+        """
+        from opencontractserver.annotations.models import (
+            Relationship,
+            StructuralAnnotationSet,
+        )
+        from opencontractserver.corpuses.models import Corpus
+        from opencontractserver.corpuses.services import CorpusDocumentService
+        from opencontractserver.utils.source_visibility import (
+            apply_source_privacy_gate,
+        )
+
+        try:
+            corpus = Corpus.objects.visible_to_user(user).get(id=corpus_id)
+        except Corpus.DoesNotExist:
+            return Relationship.objects.none()
+
+        doc_ids = CorpusDocumentService.get_corpus_documents(
+            user=user, corpus=corpus, include_deleted=False
+        ).values_list("id", flat=True)
+
+        set_ids = StructuralAnnotationSet.objects.filter(
+            documents__in=doc_ids
+        ).values_list("id", flat=True)
+
+        qs = Relationship.objects.filter(
+            Q(corpus_id=corpus_id)
+            | Q(document_id__in=doc_ids)
+            | Q(structural=True, structural_set_id__in=set_ids)
+        )
+        # Privacy gate (2026-06 audit): MCP runs with a user context, so
+        # analysis-/extract-private relationships must not surface here any
+        # more than in the document-view listing.
+        qs = apply_source_privacy_gate(qs, user)
+        if structural is not None:
+            qs = qs.filter(structural=structural)
+        return qs.distinct()
