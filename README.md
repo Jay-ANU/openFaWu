@@ -1,3 +1,10 @@
+<!-- OPENFAWU-DERIVATIVE -->
+# openFaWu · 单人私有法务 Agent
+
+本仓库基于 OpenContracts 构建。openFaWu 的启动方式、当前实现范围和安全边界见 [OPENFAWU.md](OPENFAWU.md)。下方保留完整上游说明与归属信息。
+
+---
+
 <p align="center">
   <img src="docs/assets/images/brand/icon_mark.svg" alt="OpenContracts" height="84">
 </p>

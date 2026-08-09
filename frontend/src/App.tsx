@@ -90,7 +90,7 @@ import { CorpusGroupManagement } from "./components/corpus_groups";
 import { LeaderboardRoute } from "./components/routes/LeaderboardRoute";
 import { GlobalDiscussionsRoute } from "./components/routes/GlobalDiscussionsRoute";
 import { ThreadSearchRoute } from "./views/ThreadSearchRoute";
-import { DiscoveryLanding } from "./views/DiscoveryLanding";
+import { LegalDashboard } from "./features/legal";
 import { DiscoverSearchResults } from "./views/DiscoverSearchResults";
 import { CentralRouteManager } from "./routing/CentralRouteManager";
 import { updateAnnotationDisplayParams } from "./utils/navigationUtils";
@@ -339,10 +339,8 @@ export const App = () => {
       <AuthGate useAuth0={REACT_APP_USE_AUTH0} audience={REACT_APP_AUDIENCE}>
         <Routes>
           {/* Landing/Discovery Page - Main entry point */}
-          <Route
-            path="/"
-            element={isLoading ? <div /> : <DiscoveryLanding />}
-          />
+          <Route path="/" element={isLoading ? <div /> : <LegalDashboard />} />
+          <Route path="/legal" element={<LegalDashboard />} />
           {/* Simple declarative routes with explicit prefixes */}
 
           {/* Document routes */}

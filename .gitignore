@@ -226,3 +226,7 @@ demo/import_zips/
 # incl. the CROSS-rulings bulk ingest pilot (large binaries materialized
 # from an external corpus, never meant to be committed)
 .pilot_data/
+
+.env.solo
+.envs/.solo/
+backups/openfawu/
