@@ -33,7 +33,7 @@ jobs:
             scripts/openfawu/.codex-patch-06 \
             | base64 --decode > /tmp/openfawu-codex.patch.xz
           xz -dc /tmp/openfawu-codex.patch.xz > /tmp/openfawu-codex.patch
-          git apply --index /tmp/openfawu-codex.patch
+          git apply --unidiff-zero --index /tmp/openfawu-codex.patch
           git rm \
             scripts/openfawu/.codex-patch-01 \
             scripts/openfawu/.codex-patch-02 \
