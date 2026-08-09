@@ -1,0 +1,74 @@
+name: Bootstrap openFaWu from OpenContracts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/bootstrap-openfawu.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    if: github.repository == 'Jay-ANU/openFaWu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Import pinned OpenContracts source
+        env:
+          UPSTREAM_REPOSITORY: Open-Source-Legal/OpenContracts
+          UPSTREAM_SHA: 4c0ec7ae7327380e8b4fbea81845fc5aa2133dd5
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+
+          git clone --filter=blob:none --no-checkout \
+            "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+            "$workdir/upstream"
+          git -C "$workdir/upstream" checkout --detach "$UPSTREAM_SHA"
+
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          rsync -a --exclude .git "$workdir/upstream/" ./
+
+          # Imported upstream workflows are retained for reference but disabled
+          # until they are adapted to this single-user derivative.
+          if [ -d .github/workflows ]; then
+            mkdir -p .github/upstream-workflows-disabled
+            find .github/workflows -maxdepth 1 -type f -exec mv {} .github/upstream-workflows-disabled/ \;
+            rmdir .github/workflows 2>/dev/null || true
+          fi
+
+          mkdir -p .openfawu
+          cat > .openfawu/upstream.json <<EOF
+          {
+            "repository": "https://github.com/${UPSTREAM_REPOSITORY}",
+            "commit": "${UPSTREAM_SHA}",
+            "imported_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "strategy": "source import with preserved MIT license and upstream attribution"
+          }
+          EOF
+
+          cat > .openfawu/README.md <<'EOF'
+          # openFaWu derivative metadata
+
+          This directory records the exact OpenContracts revision used as the
+          foundation of openFaWu. Product-specific work is layered on top while
+          retaining the upstream MIT license and attribution.
+          EOF
+
+          git config user.name "openFaWu bootstrap"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git commit -m "bootstrap OpenContracts legal solo foundation"
+          git push --force origin HEAD:main
