@@ -1,0 +1,47 @@
+name: openFaWu foundation CI
+
+on:
+  push:
+    branches:
+      - main
+      - "agent/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  foundation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Python foundation
+        run: |
+          python -m compileall -q opencontractserver/legal_workspace
+          python scripts/openfawu/validate_foundation.py
+
+      - name: Validate solo compose
+        run: |
+          mkdir -p .envs/.solo
+          cp docs/sample_env_files/backend/local/.postgres .envs/.solo/.postgres
+          cp docs/sample_env_files/backend/local/.django .envs/.solo/.django
+          cp docs/sample_env_files/frontend/local/django.auth.env .envs/.solo/.frontend
+          cp docs/sample_env_files/openfawu/solo.env.example .env.solo
+          docker compose --env-file .env.solo -f solo.yml config --quiet
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build legal frontend
+        run: |
+          npm ci --prefix frontend
+          npm run build --prefix frontend

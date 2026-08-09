@@ -1,0 +1,1 @@
+export { LegalDashboard } from "./LegalDashboard";

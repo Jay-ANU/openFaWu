@@ -1,0 +1,131 @@
+name: openfawu-solo
+
+volumes:
+  openfawu_postgres_data: {}
+  openfawu_postgres_backups: {}
+
+services:
+  django: &django
+    build:
+      context: .
+      dockerfile: ./compose/local/django/Dockerfile
+    image: openfawu_local_django
+    container_name: openfawu-django
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      docling-parser:
+        condition: service_started
+      docxodus-parser:
+        condition: service_started
+        required: false
+    volumes:
+      - .:/app:z
+    env_file:
+      - ./.envs/.solo/.django
+      - ./.envs/.solo/.postgres
+    environment:
+      LEGAL_SOLO_MODE: "true"
+      USE_AUTH0: "False"
+    ports:
+      - "${OPENFAWU_BACKEND_PORT:-8000}:8000"
+    command: /start
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c 'import urllib.request; urllib.request.urlopen("http://localhost:8000/admin/login/")'
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+    mem_limit: 4g
+    restart: unless-stopped
+
+  postgres:
+    build:
+      context: .
+      dockerfile: ./compose/production/postgres/Dockerfile
+    image: openfawu_postgres
+    container_name: openfawu-postgres
+    shm_size: "1g"
+    volumes:
+      - openfawu_postgres_data:/var/lib/postgresql/data:Z
+      - openfawu_postgres_backups:/backups:z
+    env_file:
+      - ./.envs/.solo/.postgres
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c maintenance_work_mem=128MB
+      -c effective_cache_size=1GB
+      -c work_mem=8MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+    mem_limit: 2g
+    restart: unless-stopped
+
+  redis:
+    image: redis:6-alpine
+    container_name: openfawu-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+    mem_limit: 512m
+    restart: unless-stopped
+
+  docling-parser:
+    image: jscrudato/docsling-local
+    container_name: openfawu-docling
+    mem_limit: 4g
+    restart: unless-stopped
+
+  docxodus-parser:
+    image: ghcr.io/open-source-legal/docxodus-service:1.1.0-docxodus5.4.2
+    container_name: openfawu-docxodus
+    mem_limit: 1g
+    restart: unless-stopped
+
+  celeryworker:
+    <<: *django
+    image: openfawu_local_django
+    container_name: openfawu-celeryworker
+    ports: []
+    healthcheck:
+      disable: true
+    depends_on:
+      django:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      docling-parser:
+        condition: service_started
+      docxodus-parser:
+        condition: service_started
+        required: false
+    command: /app/compose/local/django/celery/worker/start
+    mem_limit: 4g
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ./Dockerfile
+    image: openfawu_local_frontend
+    container_name: openfawu-frontend
+    depends_on:
+      django:
+        condition: service_healthy
+    env_file:
+      - ./.envs/.solo/.frontend
+    ports:
+      - "${OPENFAWU_FRONTEND_PORT:-3000}:3000"
+    mem_limit: 1g
+    restart: unless-stopped
