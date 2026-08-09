@@ -254,7 +254,7 @@ class Command(BaseCommand):
         else:
             self.stdout.write(
                 self.style.WARNING(
-                    "未检测到有效 OPENAI_API_KEY；界面可以启动，但 Agent 和嵌入任务不会工作。"
+                    "未检测到有效 OPENAI_API_KEY；界面与 Local Codex 可用，但 OpenContracts 内置 Agent 和远程嵌入不会工作。"
                 )
             )
         pipeline.save()

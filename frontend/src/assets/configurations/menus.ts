@@ -6,6 +6,12 @@ export const header_menu_items = [
     id: "legal_dashboard_menu_button",
   },
   {
+    title: "本地 Codex",
+    route: "/codex",
+    protected: true,
+    id: "local_codex_menu_button",
+  },
+  {
     title: "事项",
     route: "/corpuses",
     protected: true,

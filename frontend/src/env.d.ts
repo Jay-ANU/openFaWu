@@ -8,6 +8,7 @@ declare global {
       REACT_APP_USE_AUTH0: string;
       REACT_APP_USE_ANALYZERS: string;
       REACT_APP_ALLOW_IMPORTS: string;
+      REACT_APP_CODEX_BRIDGE_URL: string;
       REACT_APP_POSTHOG_API_KEY: string;
       REACT_APP_POSTHOG_HOST: string;
       [key: string]: string;

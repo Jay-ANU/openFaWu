@@ -9,6 +9,7 @@ import {
   Files,
   Scale,
   ShieldCheck,
+  TerminalSquare,
 } from "lucide-react";
 
 const Page = styled.main`
@@ -112,7 +113,7 @@ const SectionNote = styled.span`
 
 const ToolGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 14px;
 
   @media (max-width: 1000px) {
@@ -252,6 +253,13 @@ type ActionCard = {
 
 const actions: ActionCard[] = [
   {
+    title: "本地 Codex",
+    description: "通过宿主机安全桥接器连接 Codex CLI，复用本机 ChatGPT 登录、工作目录、沙箱和逐项审批。",
+    route: "/codex",
+    action: "连接执行器",
+    icon: <TerminalSquare size={21} />,
+  },
+  {
     title: "事项与合同",
     description: "建立一个独立事项空间，集中保存合同、补充材料、批注和后续对话。",
     route: "/corpuses",
@@ -348,7 +356,10 @@ export const LegalDashboard = () => {
               法务领域数据契约 <Status $ready>已就绪</Status>
             </StatusRow>
             <StatusRow>
-              自动合同审查执行器 <Status $ready={false}>下一阶段</Status>
+              本地 Codex 执行器 <Status $ready>已接入</Status>
+            </StatusRow>
+            <StatusRow>
+              自动合同审查工作流 <Status $ready={false}>持续完善</Status>
             </StatusRow>
           </StatusPanel>
         </Foundation>

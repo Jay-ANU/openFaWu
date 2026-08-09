@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: solo-init solo-up solo-down solo-logs solo-backup solo-restore solo-check
+.PHONY: solo-init solo-up solo-down solo-logs solo-backup solo-restore solo-check codex-init codex-bridge codex-token codex-check
 
 solo-init:
 	./scripts/openfawu/solo-init.sh
@@ -24,3 +24,17 @@ solo-restore:
 solo-check:
 	python3 scripts/openfawu/validate_foundation.py
 	docker compose -f solo.yml config --quiet
+
+
+codex-init:
+	./scripts/openfawu/codex-bridge-init.sh
+
+codex-bridge:
+	./scripts/openfawu/codex-bridge-up.sh
+
+codex-token:
+	@./scripts/openfawu/codex-bridge-token.sh
+
+codex-check:
+	python3 -m compileall -q openfawu_codex_bridge
+	python3 -m unittest discover -s openfawu_codex_bridge/tests -v

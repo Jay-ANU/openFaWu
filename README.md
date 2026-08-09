@@ -1,7 +1,7 @@
 <!-- OPENFAWU-DERIVATIVE -->
 # openFaWu · 单人私有法务 Agent
 
-本仓库基于 OpenContracts 构建。openFaWu 的启动方式、当前实现范围和安全边界见 [OPENFAWU.md](OPENFAWU.md)。下方保留完整上游说明与归属信息。
+本仓库基于 OpenContracts 构建，并提供仅监听本机回环地址的 Local Codex App-Server 桥接器。openFaWu 的启动方式、当前实现范围和安全边界见 [OPENFAWU.md](OPENFAWU.md)，Codex 接入说明见 [docs/legal-solo/local-codex.md](docs/legal-solo/local-codex.md)。下方保留完整上游说明与归属信息。
 
 ---
 

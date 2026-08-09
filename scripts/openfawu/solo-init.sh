@@ -103,9 +103,10 @@ upsert_env .envs/.solo/.frontend OPEN_CONTRACTS_REACT_APP_USE_AUTH0 false
 upsert_env .envs/.solo/.frontend OPEN_CONTRACTS_REACT_APP_USE_ANALYZERS true
 upsert_env .envs/.solo/.frontend OPEN_CONTRACTS_REACT_APP_ALLOW_IMPORTS true
 upsert_env .envs/.solo/.frontend OPEN_CONTRACTS_REACT_APP_API_ROOT_URL "http://localhost:${OPENFAWU_BACKEND_PORT:-8000}"
+upsert_env .envs/.solo/.frontend OPEN_CONTRACTS_REACT_APP_CODEX_BRIDGE_URL "http://127.0.0.1:8765"
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "警告：OPENAI_API_KEY 为空。系统会启动，但 AI 与嵌入任务暂不可用。"
+  echo "提示：OPENAI_API_KEY 为空。Local Codex 仍可使用；OpenContracts 内置 Agent 与远程嵌入暂不可用。"
 fi
 
 echo "构建 openFaWu 单人版镜像……"
@@ -124,6 +125,10 @@ docker compose --env-file .env.solo -f solo.yml run --rm django \
 echo "启动完整服务……"
 docker compose --env-file .env.solo -f solo.yml up -d
 
+# Create the host-side Codex bridge configuration, but do not start it inside
+# Docker: Codex must use the current user's local login and filesystem.
+./scripts/openfawu/codex-bridge-init.sh --quiet
+
 cat <<EOF
 
 openFaWu 已启动：
@@ -131,5 +136,10 @@ openFaWu 已启动：
   后端：http://localhost:${OPENFAWU_BACKEND_PORT:-8000}
   用户：${OPENFAWU_USERNAME}
   密码已保存在本机 .env.solo 中。
+
+本地 Codex（可选）：
+  启动桥接器：make -f openfawu.mk codex-bridge
+  查看 Token： make -f openfawu.mk codex-token
+  网页入口：   http://localhost:${OPENFAWU_FRONTEND_PORT:-3000}/codex
 
 EOF

@@ -228,5 +228,6 @@ demo/import_zips/
 .pilot_data/
 
 .env.solo
+.env.codex
 .envs/.solo/
 backups/openfawu/
