@@ -49,8 +49,8 @@ jobs:
 
       - name: Build frontend
         run: |
-          npm ci --prefix frontend
-          npm run build --prefix frontend
+          yarn --cwd frontend install --frozen-lockfile
+          yarn --cwd frontend build
 
       - name: Finalize permanent CI and commit
         run: |
