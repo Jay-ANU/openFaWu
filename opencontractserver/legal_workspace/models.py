@@ -80,9 +80,9 @@ class LegalWorkspace(TimeStampedModel):
     class Meta:
         ordering = ("-updated_at",)
         indexes = [
-            models.Index(fields=["owner", "workspace_type"]),
-            models.Index(fields=["owner", "matter_status"]),
-            models.Index(fields=["jurisdiction", "workspace_type"]),
+            models.Index(fields=["owner", "workspace_type"], name="legal_work_owner_i_63d9c5_idx"),
+            models.Index(fields=["owner", "matter_status"], name="legal_work_owner_i_2ea1f1_idx"),
+            models.Index(fields=["jurisdiction", "workspace_type"], name="legal_work_jurisdi_293d63_idx"),
         ]
 
     def clean(self) -> None:
@@ -134,8 +134,8 @@ class ReviewProfile(TimeStampedModel):
             )
         ]
         indexes = [
-            models.Index(fields=["owner", "enabled"]),
-            models.Index(fields=["contract_type", "party_position", "jurisdiction"]),
+            models.Index(fields=["owner", "enabled"], name="legal_revi_owner_i_73935d_idx"),
+            models.Index(fields=["contract_type", "party_position", "jurisdiction"], name="legal_revi_contrac_83a773_idx"),
         ]
 
     def __str__(self) -> str:
@@ -196,8 +196,8 @@ class PlaybookRule(TimeStampedModel):
             )
         ]
         indexes = [
-            models.Index(fields=["review_profile", "enabled", "sort_order"]),
-            models.Index(fields=["category", "severity"]),
+            models.Index(fields=["review_profile", "enabled", "sort_order"], name="legal_play_review__73bb20_idx"),
+            models.Index(fields=["category", "severity"], name="legal_play_categor_38a677_idx"),
         ]
 
     def __str__(self) -> str:
@@ -293,9 +293,9 @@ class ReviewRun(TimeStampedModel):
     class Meta:
         ordering = ("-created_at",)
         indexes = [
-            models.Index(fields=["workspace", "status"]),
-            models.Index(fields=["document", "created_at"]),
-            models.Index(fields=["created_by", "created_at"]),
+            models.Index(fields=["workspace", "status"], name="legal_revi_workspa_7f8326_idx"),
+            models.Index(fields=["document", "created_at"], name="legal_revi_documen_6cb39a_idx"),
+            models.Index(fields=["created_by", "created_at"], name="legal_revi_created_aab89a_idx"),
         ]
 
     def clean(self) -> None:
@@ -363,8 +363,8 @@ class ContractClause(TimeStampedModel):
     class Meta:
         ordering = ("sort_order", "id")
         indexes = [
-            models.Index(fields=["review_run", "sort_order"]),
-            models.Index(fields=["review_run", "clause_type"]),
+            models.Index(fields=["review_run", "sort_order"], name="legal_clau_review__a14d7e_idx"),
+            models.Index(fields=["review_run", "clause_type"], name="legal_clau_review__584772_idx"),
         ]
         constraints = [
             models.CheckConstraint(
@@ -468,9 +468,9 @@ class ContractFinding(TimeStampedModel):
     class Meta:
         ordering = ("sort_order", "id")
         indexes = [
-            models.Index(fields=["review_run", "severity", "sort_order"]),
-            models.Index(fields=["review_run", "verification_status"]),
-            models.Index(fields=["review_run", "review_status"]),
+            models.Index(fields=["review_run", "severity", "sort_order"], name="legal_cont_review__0c099c_idx"),
+            models.Index(fields=["review_run", "verification_status"], name="legal_cont_review__2909fb_idx"),
+            models.Index(fields=["review_run", "review_status"], name="legal_cont_review__6d5193_idx"),
         ]
         constraints = [
             models.CheckConstraint(
@@ -539,9 +539,9 @@ class ResearchRun(TimeStampedModel):
     class Meta:
         ordering = ("-created_at",)
         indexes = [
-            models.Index(fields=["workspace", "status"]),
-            models.Index(fields=["created_by", "created_at"]),
-            models.Index(fields=["jurisdiction", "cutoff_date"]),
+            models.Index(fields=["workspace", "status"], name="legal_rese_workspa_a44901_idx"),
+            models.Index(fields=["created_by", "created_at"], name="legal_rese_created_fc5167_idx"),
+            models.Index(fields=["jurisdiction", "cutoff_date"], name="legal_rese_jurisdi_e86d54_idx"),
         ]
 
     def clean(self) -> None:
